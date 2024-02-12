@@ -74,8 +74,6 @@ func (s *Server) StartUds(socketPath string) {
 	s.mu.Lock()
 	hl, err := natsListen("unix", socketPath)
 
-	// TODO: how do we get notified of server shutdown, so that we can delete the file.
-
 	if err != nil {
 		s.mu.Unlock()
 		s.Fatalf("Unable to listen for UDS connections: %v", err)
@@ -91,7 +89,6 @@ func (s *Server) StartUds(socketPath string) {
 		<-s.quitCh
 		s.Tracef("Removing UDS socket: %s", hl.Addr().String())
 
-		err = os.Remove(socketPath)
 		err = os.Remove(socketPath)
 		if err != nil {
 			s.Tracef("Failed to remove UDS, %v", err)
