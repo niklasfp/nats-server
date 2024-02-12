@@ -102,6 +102,9 @@ func main() {
 	fs := flag.NewFlagSet(exe, flag.ExitOnError)
 	fs.Usage = usage
 
+	// Initialize UDS Options
+	udsOpts := server.InitUDSOptions(fs, &usageStr)
+
 	// Configure the options from the flags/config file
 	opts, err := server.ConfigureOptions(fs, os.Args[1:],
 		server.PrintServerAndExit,
@@ -112,6 +115,11 @@ func main() {
 	} else if opts.CheckConfig {
 		fmt.Fprintf(os.Stderr, "%s: configuration file %s is valid\n", exe, opts.ConfigFile)
 		os.Exit(0)
+	}
+
+	// Handle UDS configuration options
+	if err := server.ConfigureUDSOptions(udsOpts); err != nil {
+		server.PrintAndDie(fmt.Sprintf("%s: %s", exe, err))
 	}
 
 	// Create the server with appropriate options.
@@ -126,6 +134,11 @@ func main() {
 	// Start things up. Block here until done.
 	if err := server.Run(s); err != nil {
 		server.PrintAndDie(err.Error())
+	}
+
+	if udsOpts.ListenUds {
+		// Start listening for UDS connections
+		s.StartUds(udsOpts.SocketPath)
 	}
 
 	// Adjust MAXPROCS if running under linux/cgroups quotas.
