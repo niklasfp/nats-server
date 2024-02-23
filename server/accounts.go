@@ -96,6 +96,7 @@ type Account struct {
 	nameTag      string
 	lastLimErr   int64
 	routePoolIdx int
+	traceDest    string
 }
 
 const (
@@ -156,6 +157,7 @@ type serviceImport struct {
 	share       bool
 	tracking    bool
 	didDeliver  bool
+	atrc        bool        // allow trace (got from service export)
 	trackingHdr http.Header // header from request
 }
 
@@ -255,11 +257,28 @@ func (a *Account) String() string {
 	return a.Name
 }
 
+func (a *Account) setTraceDest(dest string) {
+	a.mu.Lock()
+	a.traceDest = dest
+	a.mu.Unlock()
+}
+
+func (a *Account) getTraceDest() string {
+	a.mu.RLock()
+	dest := a.traceDest
+	a.mu.RUnlock()
+	return dest
+}
+
 // Used to create shallow copies of accounts for transfer
 // from opts to real accounts in server struct.
+// Account `na` write lock is expected to be held on entry
+// while account `a` is the one from the Options struct
+// being loaded/reloaded and do not need locking.
 func (a *Account) shallowCopy(na *Account) {
 	na.Nkey = a.Nkey
 	na.Issuer = a.Issuer
+	na.traceDest = a.traceDest
 
 	if a.imports.streams != nil {
 		na.imports.streams = make([]*streamImport, 0, len(a.imports.streams))
@@ -1890,11 +1909,13 @@ func (a *Account) addServiceImport(dest *Account, from, to string, claim *jwt.Im
 		return nil, ErrMissingAccount
 	}
 
+	var atrc bool
 	dest.mu.RLock()
 	se := dest.getServiceExport(to)
 	if se != nil {
 		rt = se.respType
 		lat = se.latency
+		atrc = se.atrc
 	}
 	dest.mu.RUnlock()
 
@@ -1938,7 +1959,7 @@ func (a *Account) addServiceImport(dest *Account, from, to string, claim *jwt.Im
 	if claim != nil {
 		share = claim.Share
 	}
-	si := &serviceImport{dest, claim, se, nil, from, to, tr, 0, rt, lat, nil, nil, usePub, false, false, share, false, false, nil}
+	si := &serviceImport{dest, claim, se, nil, from, to, tr, 0, rt, lat, nil, nil, usePub, false, false, share, false, false, atrc, nil}
 	a.imports.services[from] = si
 	a.mu.Unlock()
 
@@ -2162,9 +2183,15 @@ func shouldSample(l *serviceLatency, c *client) (bool, http.Header) {
 		}
 		return true, http.Header{trcB3: b3} // sampling allowed or left to recipient of header
 	} else if tId := h[trcCtx]; len(tId) != 0 {
+		var sample bool
 		// sample 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 		tk := strings.Split(tId[0], "-")
-		if len(tk) == 4 && len([]byte(tk[3])) == 2 && tk[3] == "01" {
+		if len(tk) == 4 && len([]byte(tk[3])) == 2 {
+			if hexVal, err := strconv.ParseInt(tk[3], 16, 8); err == nil {
+				sample = hexVal&0x1 == 0x1
+			}
+		}
+		if sample {
 			return true, newTraceCtxHeader(h, tId)
 		} else {
 			return false, nil
@@ -2397,7 +2424,7 @@ func (a *Account) addRespServiceImport(dest *Account, to string, osi *serviceImp
 
 	// dest is the requestor's account. a is the service responder with the export.
 	// Marked as internal here, that is how we distinguish.
-	si := &serviceImport{dest, nil, osi.se, nil, nrr, to, nil, 0, rt, nil, nil, nil, false, true, false, osi.share, false, false, nil}
+	si := &serviceImport{dest, nil, osi.se, nil, nrr, to, nil, 0, rt, nil, nil, nil, false, true, false, osi.share, false, false, false, nil}
 
 	if a.exports.responses == nil {
 		a.exports.responses = make(map[string]*serviceImport)
@@ -2507,10 +2534,9 @@ func (a *Account) addMappedStreamImportWithClaim(account *Account, from, to stri
 		a.mu.Unlock()
 		return ErrStreamImportDuplicate
 	}
-	// TODO(ik): When AllowTrace is added to JWT, uncomment those lines:
-	// if imClaim != nil {
-	// 	allowTrace = imClaim.AllowTrace
-	// }
+	if imClaim != nil {
+		allowTrace = imClaim.AllowTrace
+	}
 	a.imports.streams = append(a.imports.streams, &streamImport{account, from, to, tr, nil, imClaim, usePub, false, allowTrace})
 	a.mu.Unlock()
 	return nil
@@ -2845,7 +2871,9 @@ func (a *Account) checkStreamImportsEqual(b *Account) bool {
 		bm[bim.acc.Name+bim.from+bim.to] = bim
 	}
 	for _, aim := range a.imports.streams {
-		if _, ok := bm[aim.acc.Name+aim.from+aim.to]; !ok {
+		if bim, ok := bm[aim.acc.Name+aim.from+aim.to]; !ok {
+			return false
+		} else if aim.atrc != bim.atrc {
 			return false
 		}
 	}
@@ -2930,6 +2958,9 @@ func isServiceExportEqual(a, b *serviceExport) bool {
 		if a.latency.subject != b.latency.subject {
 			return false
 		}
+	}
+	if a.atrc != b.atrc {
+		return false
 	}
 	return true
 }
@@ -3208,6 +3239,13 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 	a.nameTag = ac.Name
 	a.tags = ac.Tags
 
+	if ac.Trace != nil {
+		// Update TraceDest
+		a.traceDest = string(ac.Trace.Destination)
+	} else {
+		a.traceDest = _EMPTY_
+	}
+
 	// Check for external authorization.
 	if ac.HasExternalAuthorization() {
 		a.extAuth = &jwt.ExternalAuthorization{}
@@ -3335,6 +3373,9 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 				if err := a.SetServiceExportResponseThreshold(sub, e.ResponseThreshold); err != nil {
 					s.Debugf("Error adding service export response threshold for [%s]: %v", a.traceLabel(), err)
 				}
+			}
+			if err := a.SetServiceExportAllowTrace(sub, e.AllowTrace); err != nil {
+				s.Debugf("Error adding allow_trace for %q: %v", sub, err)
 			}
 		}
 
@@ -3476,10 +3517,15 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 				if si != nil && si.acc.Name == a.Name {
 					// Check for if we are still authorized for an import.
 					si.invalid = !a.checkServiceImportAuthorized(acc, si.to, si.claim)
-					if si.latency != nil && !si.response {
-						// Make sure we should still be tracking latency.
+					// Make sure we should still be tracking latency and if we
+					// are allowed to trace.
+					if !si.response {
 						if se := a.getServiceExport(si.to); se != nil {
-							si.latency = se.latency
+							if si.latency != nil {
+								si.latency = se.latency
+							}
+							// Update allow trace.
+							si.atrc = se.atrc
 						}
 					}
 				}

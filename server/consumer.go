@@ -3100,7 +3100,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 				// Since we can't send that message to the requestor, we need to
 				// notify that we are closing the request.
 				const maxBytesT = "NATS/1.0 409 Message Size Exceeds MaxBytes\r\n%s: %d\r\n%s: %d\r\n\r\n"
-				hdr := []byte(fmt.Sprintf(maxBytesT, JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b))
+				hdr := fmt.Appendf(nil, maxBytesT, JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
 				o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 				// Remove the current one, no longer valid due to max bytes limit.
 				o.waiting.removeCurrent()
@@ -3123,7 +3123,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 			}
 		} else {
 			// We do check for expiration in `processWaiting`, but it is possible to hit the expiry here, and not there.
-			hdr := []byte(fmt.Sprintf("NATS/1.0 408 Request Timeout\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b))
+			hdr := fmt.Appendf(nil, "NATS/1.0 408 Request Timeout\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
 			o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 			o.waiting.removeCurrent()
 			if o.node != nil {
@@ -3135,7 +3135,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 		}
 		if wr.interest != wr.reply {
 			const intExpT = "NATS/1.0 408 Interest Expired\r\n%s: %d\r\n%s: %d\r\n\r\n"
-			hdr := []byte(fmt.Sprintf(intExpT, JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b))
+			hdr := fmt.Appendf(nil, intExpT, JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
 			o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 		}
 		// Remove the current one, no longer valid.
@@ -3208,7 +3208,7 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 	}
 
 	sendErr := func(status int, description string) {
-		hdr := []byte(fmt.Sprintf("NATS/1.0 %d %s\r\n\r\n", status, description))
+		hdr := fmt.Appendf(nil, "NATS/1.0 %d %s\r\n\r\n", status, description)
 		o.outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 	}
 
@@ -3600,7 +3600,7 @@ func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
 		wr := wq.reqs[rp]
 		// Check expiration.
 		if (eos && wr.noWait && wr.d > 0) || (!wr.expires.IsZero() && now.After(wr.expires)) {
-			hdr := []byte(fmt.Sprintf("NATS/1.0 408 Request Timeout\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b))
+			hdr := fmt.Appendf(nil, "NATS/1.0 408 Request Timeout\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
 			o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 			remove(wr, rp)
 			i++
@@ -4033,7 +4033,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 
 		// If given request fulfilled batch size, but there are still pending bytes, send information about it.
 		if wrn <= 0 && wrb > 0 {
-			o.outq.send(newJSPubMsg(dsubj, _EMPTY_, _EMPTY_, []byte(fmt.Sprintf(JsPullRequestRemainingBytesT, JSPullRequestPendingMsgs, wrn, JSPullRequestPendingBytes, wrb)), nil, nil, 0))
+			o.outq.send(newJSPubMsg(dsubj, _EMPTY_, _EMPTY_, fmt.Appendf(nil, JsPullRequestRemainingBytesT, JSPullRequestPendingMsgs, wrn, JSPullRequestPendingBytes, wrb), nil, nil, 0))
 		}
 		// Reset our idle heartbeat timer if set.
 		if hb != nil {
@@ -4096,10 +4096,10 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 func (o *consumer) sendIdleHeartbeat(subj string) {
 	const t = "NATS/1.0 100 Idle Heartbeat\r\n%s: %d\r\n%s: %d\r\n\r\n"
 	sseq, dseq := o.sseq-1, o.dseq-1
-	hdr := []byte(fmt.Sprintf(t, JSLastConsumerSeq, dseq, JSLastStreamSeq, sseq))
+	hdr := fmt.Appendf(nil, t, JSLastConsumerSeq, dseq, JSLastStreamSeq, sseq)
 	if fcp := o.fcid; fcp != _EMPTY_ {
 		// Add in that we are stalled on flow control here.
-		addOn := []byte(fmt.Sprintf("%s: %s\r\n\r\n", JSConsumerStalled, fcp))
+		addOn := fmt.Appendf(nil, "%s: %s\r\n\r\n", JSConsumerStalled, fcp)
 		hdr = append(hdr[:len(hdr)-LEN_CR_LF], []byte(addOn)...)
 	}
 	o.outq.send(newJSPubMsg(subj, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
@@ -4783,6 +4783,23 @@ func (o *consumer) selectStartingSeqNo() {
 				// If we are here we are time based.
 				// TODO(dlc) - Once clustered can't rely on this.
 				o.sseq = o.mset.store.GetSeqFromTime(*o.cfg.OptStartTime)
+				// Here we want to see if we are filtered, and if so possibly close the gap
+				// to the nearest first given our starting sequence from time. This is so we do
+				// not force the system to do a linear walk between o.sseq and the real first.
+				if len(o.subjf) > 0 {
+					nseq := state.LastSeq
+					for _, filter := range o.subjf {
+						// Use first sequence since this is more optimized atm.
+						ss := o.mset.store.FilteredState(state.FirstSeq, filter.subject)
+						if ss.First > o.sseq && ss.First < nseq {
+							nseq = ss.First
+						}
+					}
+					// Skip ahead if possible.
+					if nseq > o.sseq && nseq < state.LastSeq {
+						o.sseq = nseq
+					}
+				}
 			} else {
 				// DeliverNew
 				o.sseq = state.LastSeq + 1
@@ -4901,15 +4918,24 @@ func (o *consumer) hasNoLocalInterest() bool {
 
 // This is when the underlying stream has been purged.
 // sseq is the new first seq for the stream after purge.
-// Lock should be held.
-func (o *consumer) purge(sseq uint64, slseq uint64) {
+// Lock should NOT be held.
+func (o *consumer) purge(sseq uint64, slseq uint64, isWider bool) {
 	// Do not update our state unless we know we are the leader.
 	if !o.isLeader() {
 		return
 	}
 	// Signals all have been purged for this consumer.
-	if sseq == 0 {
+	if sseq == 0 && !isWider {
 		sseq = slseq + 1
+	}
+
+	var store StreamStore
+	if isWider {
+		o.mu.RLock()
+		if o.mset != nil {
+			store = o.mset.store
+		}
+		o.mu.RUnlock()
 	}
 
 	o.mu.Lock()
@@ -4920,7 +4946,6 @@ func (o *consumer) purge(sseq uint64, slseq uint64) {
 
 	if o.asflr < sseq {
 		o.asflr = sseq - 1
-
 		// We need to remove those no longer relevant from pending.
 		for seq, p := range o.pending {
 			if seq <= o.asflr {
@@ -4934,8 +4959,24 @@ func (o *consumer) purge(sseq uint64, slseq uint64) {
 				delete(o.rdc, seq)
 				// rdq handled below.
 			}
+			if isWider && store != nil {
+				// Our filtered subject, which could be all, is wider than the underlying purge.
+				// We need to check if the pending items left are still valid.
+				var smv StoreMsg
+				if _, err := store.LoadMsg(seq, &smv); err == errDeletedMsg || err == ErrStoreMsgNotFound {
+					if p.Sequence > o.adflr {
+						o.adflr = p.Sequence
+						if o.adflr > o.dseq {
+							o.dseq = o.adflr
+						}
+					}
+					delete(o.pending, seq)
+					delete(o.rdc, seq)
+				}
+			}
 		}
 	}
+
 	// This means we can reset everything at this point.
 	if len(o.pending) == 0 {
 		o.pending, o.rdc = nil, nil
