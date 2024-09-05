@@ -1632,7 +1632,7 @@ type captureWarnLogger struct {
 	warn chan string
 }
 
-func (l *captureWarnLogger) Warnf(format string, v ...interface{}) {
+func (l *captureWarnLogger) Warnf(format string, v ...any) {
 	select {
 	case l.warn <- fmt.Sprintf(format, v...):
 	default:
@@ -2137,7 +2137,7 @@ type testConnWritePartial struct {
 func (c *testConnWritePartial) Write(p []byte) (int, error) {
 	n := len(p)
 	if c.partial {
-		n = 15
+		n = n/2 + 1
 	}
 	return c.buf.Write(p[:n])
 }
@@ -2193,7 +2193,7 @@ type captureNoticeLogger struct {
 	notices []string
 }
 
-func (l *captureNoticeLogger) Noticef(format string, v ...interface{}) {
+func (l *captureNoticeLogger) Noticef(format string, v ...any) {
 	l.Lock()
 	l.notices = append(l.notices, fmt.Sprintf(format, v...))
 	l.Unlock()
@@ -2943,4 +2943,183 @@ func TestTLSClientHandshakeFirstAndInProcessConnection(t *testing.T) {
 	if _, err = nc.TLSConnectionState(); err != nil {
 		t.Fatal("Should have not got an error retrieving TLS connection state")
 	}
+}
+
+func TestRemoveHeaderIfPrefixPresent(t *testing.T) {
+	hdr := []byte("NATS/1.0\r\n\r\n")
+
+	hdr = genHeader(hdr, "a", "1")
+	hdr = genHeader(hdr, JSExpectedStream, "my-stream")
+	hdr = genHeader(hdr, JSExpectedLastSeq, "22")
+	hdr = genHeader(hdr, "b", "2")
+	hdr = genHeader(hdr, JSExpectedLastSubjSeq, "24")
+	hdr = genHeader(hdr, JSExpectedLastMsgId, "1")
+	hdr = genHeader(hdr, "c", "3")
+
+	hdr = removeHeaderIfPrefixPresent(hdr, "Nats-Expected-")
+
+	if !bytes.Equal(hdr, []byte("NATS/1.0\r\na: 1\r\nb: 2\r\nc: 3\r\n\r\n")) {
+		t.Fatalf("Expected headers to be stripped, got %q", hdr)
+	}
+}
+
+func TestInProcessAllowedConnectionType(t *testing.T) {
+	tmpl := `
+		listen: "127.0.0.1:-1"
+		accounts {
+			A { users: [{user: "test", password: "pwd", allowed_connection_types: ["%s"]}] }
+		}
+		write_deadline: "500ms"
+	`
+	for _, test := range []struct {
+		name          string
+		ct            string
+		inProcessOnly bool
+	}{
+		{"conf inprocess", jwt.ConnectionTypeInProcess, true},
+		{"conf standard", jwt.ConnectionTypeStandard, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, test.ct)))
+			s, _ := RunServerWithConfig(conf)
+			defer s.Shutdown()
+
+			// Create standard connection
+			nc, err := nats.Connect(s.ClientURL(), nats.UserInfo("test", "pwd"))
+			if test.inProcessOnly && err == nil {
+				nc.Close()
+				t.Fatal("Expected standard connection to fail, it did not")
+			}
+			// Works if nc is nil (which it will if only in-process are allowed)
+			nc.Close()
+
+			// Create inProcess connection
+			nc, err = nats.Connect(_EMPTY_, nats.UserInfo("test", "pwd"), nats.InProcessServer(s))
+			if !test.inProcessOnly && err == nil {
+				nc.Close()
+				t.Fatal("Expected in-process connection to fail, it did not")
+			}
+			// Works if nc is nil (which it will if only standard are allowed)
+			nc.Close()
+		})
+	}
+	for _, test := range []struct {
+		name          string
+		ct            string
+		inProcessOnly bool
+	}{
+		{"jwt inprocess", jwt.ConnectionTypeInProcess, true},
+		{"jwt standard", jwt.ConnectionTypeStandard, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			skp, _ := nkeys.FromSeed(oSeed)
+			spub, _ := skp.PublicKey()
+
+			o := defaultServerOptions
+			o.TrustedKeys = []string{spub}
+			o.WriteDeadline = 500 * time.Millisecond
+			s := RunServer(&o)
+			defer s.Shutdown()
+
+			buildMemAccResolver(s)
+
+			kp, _ := nkeys.CreateAccount()
+			aPub, _ := kp.PublicKey()
+			claim := jwt.NewAccountClaims(aPub)
+			aJwt, err := claim.Encode(oKp)
+			require_NoError(t, err)
+
+			addAccountToMemResolver(s, aPub, aJwt)
+
+			creds := createUserWithLimit(t, kp, time.Time{},
+				func(j *jwt.UserPermissionLimits) {
+					j.AllowedConnectionTypes.Add(test.ct)
+				})
+			// Create standard connection
+			nc, err := nats.Connect(s.ClientURL(), nats.UserCredentials(creds))
+			if test.inProcessOnly && err == nil {
+				nc.Close()
+				t.Fatal("Expected standard connection to fail, it did not")
+			}
+			// Works if nc is nil (which it will if only in-process are allowed)
+			nc.Close()
+
+			// Create inProcess connection
+			nc, err = nats.Connect(_EMPTY_, nats.UserCredentials(creds), nats.InProcessServer(s))
+			if !test.inProcessOnly && err == nil {
+				nc.Close()
+				t.Fatal("Expected in-process connection to fail, it did not")
+			}
+			// Works if nc is nil (which it will if only standard are allowed)
+			nc.Close()
+		})
+	}
+}
+
+func TestClientFlushOutboundNoSlowConsumer(t *testing.T) {
+	opts := DefaultOptions()
+	opts.MaxPending = 1024 * 1024 * 140 // 140MB
+	opts.MaxPayload = 1024 * 1024 * 16  // 16MB
+	opts.WriteDeadline = time.Second * 30
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port))
+	defer nc.Close()
+
+	proxy := newNetProxy(0, 1024*1024*8, 1024*1024*8, s.ClientURL()) // 8MB/s
+	defer proxy.stop()
+
+	wait := make(chan error)
+
+	nca, err := nats.Connect(proxy.clientURL())
+	require_NoError(t, err)
+	nca.SetDisconnectErrHandler(func(c *nats.Conn, err error) {
+		wait <- err
+		close(wait)
+	})
+
+	ncb, err := nats.Connect(s.ClientURL())
+	require_NoError(t, err)
+
+	_, err = nca.Subscribe("test", func(msg *nats.Msg) {
+		wait <- nil
+	})
+	require_NoError(t, err)
+
+	// Publish 128MB of data onto the test subject. This will
+	// mean that the outbound queue for nca has more than 64MB,
+	// which is the max we will send into a single writev call.
+	payload := make([]byte, 1024*1024*16) // 16MB
+	for i := 0; i < 8; i++ {
+		require_NoError(t, ncb.Publish("test", payload))
+	}
+
+	// Get the client ID for nca.
+	cid, err := nca.GetClientID()
+	require_NoError(t, err)
+
+	// Check that the client queue has more than 64MB queued
+	// up in it.
+	s.mu.RLock()
+	ca := s.clients[cid]
+	s.mu.RUnlock()
+	ca.mu.Lock()
+	pba := ca.out.pb
+	ca.mu.Unlock()
+	require_True(t, pba > 1024*1024*64)
+
+	// Wait for our messages to be delivered. This will take
+	// a few seconds as the client is limited to 8MB/s, so it
+	// can't deliver messages to us as quickly as the other
+	// client can publish them.
+	var msgs int
+	for err := range wait {
+		require_NoError(t, err)
+		msgs++
+		if msgs == 8 {
+			break
+		}
+	}
+	require_Equal(t, msgs, 8)
 }

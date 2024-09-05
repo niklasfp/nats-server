@@ -14,6 +14,7 @@
 package server
 
 import (
+	"cmp"
 	"fmt"
 	"math/rand"
 	"net/url"
@@ -52,14 +53,14 @@ func RunRandClientPortServer(t *testing.T) *Server {
 	return RunServer(&opts)
 }
 
-func require_True(t *testing.T, b bool) {
+func require_True(t testing.TB, b bool) {
 	t.Helper()
 	if !b {
 		t.Fatalf("require true, but got false")
 	}
 }
 
-func require_False(t *testing.T, b bool) {
+func require_False(t testing.TB, b bool) {
 	t.Helper()
 	if b {
 		t.Fatalf("require false, but got true")
@@ -89,7 +90,7 @@ func require_Contains(t *testing.T, s string, subStrs ...string) {
 	}
 }
 
-func require_Error(t *testing.T, err error, expected ...error) {
+func require_Error(t testing.TB, err error, expected ...error) {
 	t.Helper()
 	if err == nil {
 		t.Fatalf("require error, but got none")
@@ -112,28 +113,28 @@ func require_Error(t *testing.T, err error, expected ...error) {
 	t.Fatalf("Expected one of %v, got '%v'", expected, err)
 }
 
-func require_Equal[T comparable](t *testing.T, a, b T) {
+func require_Equal[T comparable](t testing.TB, a, b T) {
 	t.Helper()
 	if a != b {
 		t.Fatalf("require %T equal, but got: %v != %v", a, a, b)
 	}
 }
 
-func require_NotEqual[T comparable](t *testing.T, a, b T) {
+func require_NotEqual[T comparable](t testing.TB, a, b T) {
 	t.Helper()
 	if a == b {
-		t.Fatalf("require %T not equal, but got: %v != %v", a, a, b)
+		t.Fatalf("require %T not equal, but got: %v == %v", a, a, b)
 	}
 }
 
-func require_Len(t *testing.T, a, b int) {
+func require_Len(t testing.TB, a, b int) {
 	t.Helper()
 	if a != b {
 		t.Fatalf("require len, but got: %v != %v", a, b)
 	}
 }
 
-func require_LessThan[T ordered](t *testing.T, a, b T) {
+func require_LessThan[T cmp.Ordered](t *testing.T, a, b T) {
 	t.Helper()
 	if a >= b {
 		t.Fatalf("require %v to be less than %v", a, b)
@@ -149,6 +150,15 @@ func require_ChanRead[T any](t *testing.T, ch chan T, timeout time.Duration) T {
 		t.Fatalf("require read from channel within %v but didn't get anything", timeout)
 	}
 	panic("this shouldn't be possible")
+}
+
+func require_NoChanRead[T any](t *testing.T, ch chan T, timeout time.Duration) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Fatalf("require no read from channel within %v but got something", timeout)
+	case <-time.After(timeout):
+	}
 }
 
 func checkNatsError(t *testing.T, e *ApiError, id ErrorIdentifier) {
@@ -294,6 +304,7 @@ func (c *cluster) shutdown() {
 	for i, s := range c.servers {
 		sd := s.StoreDir()
 		s.Shutdown()
+		s.WaitForShutdown()
 		if cf := c.opts[i].ConfigFile; cf != _EMPTY_ {
 			os.Remove(cf)
 		}
@@ -338,18 +349,4 @@ func runSolicitLeafServerToURL(surl string) (*Server, *Options) {
 	o.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{rurl}}}
 	o.LeafNode.ReconnectInterval = 100 * time.Millisecond
 	return RunServer(&o), &o
-}
-
-// ordered is a constraint that permits any ordered type.
-//
-// To avoid a dependency on go1.21+ or golang.org/x/exp, we copy the ordered
-// interface def from go 1.21.3:src/cmp/cmp.go (https://pkg.go.dev/cmp#Ordered).
-//
-// When this repo is updated to go 1.21+, this should be deleted and references
-// replaced by cmp.Ordered.
-type ordered interface {
-	~int | ~int8 | ~int16 | ~int32 | ~int64 |
-		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr |
-		~float32 | ~float64 |
-		~string
 }

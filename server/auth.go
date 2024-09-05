@@ -15,6 +15,7 @@ package server
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -59,6 +60,7 @@ type ClientAuthentication interface {
 // NkeyUser is for multiple nkey based users
 type NkeyUser struct {
 	Nkey                   string              `json:"user"`
+	Issued                 int64               `json:"issued,omitempty"` // this is a copy of the issued at (iat) field in the jwt
 	Permissions            *Permissions        `json:"permissions,omitempty"`
 	Account                *Account            `json:"account,omitempty"`
 	SigningKey             string              `json:"signing_key,omitempty"`
@@ -83,9 +85,10 @@ func (u *User) clone() *User {
 	}
 	clone := &User{}
 	*clone = *u
+	// Account is not cloned because it is always by reference to an existing struct.
 	clone.Permissions = u.Permissions.clone()
 
-	if len(u.AllowedConnectionTypes) > 0 {
+	if u.AllowedConnectionTypes != nil {
 		clone.AllowedConnectionTypes = make(map[string]struct{})
 		for k, v := range u.AllowedConnectionTypes {
 			clone.AllowedConnectionTypes[k] = v
@@ -103,7 +106,16 @@ func (n *NkeyUser) clone() *NkeyUser {
 	}
 	clone := &NkeyUser{}
 	*clone = *n
+	// Account is not cloned because it is always by reference to an existing struct.
 	clone.Permissions = n.Permissions.clone()
+
+	if n.AllowedConnectionTypes != nil {
+		clone.AllowedConnectionTypes = make(map[string]struct{})
+		for k, v := range n.AllowedConnectionTypes {
+			clone.AllowedConnectionTypes[k] = v
+		}
+	}
+
 	return clone
 }
 
@@ -594,12 +606,38 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			}
 			return
 		}
-		// We have a juc defined here, check account.
+		// We have a juc, check if externally managed, i.e. should be delegated
+		// to the auth callout service.
 		if juc != nil && !acc.hasExternalAuth() {
 			if !authorized {
 				s.sendAccountAuthErrorEvent(c, c.acc, reason)
 			}
 			return
+		}
+		// Check config-mode. The global account is a condition since users that
+		// are not found in the config are implicitly bound to the global account.
+		// This means those users should be implicitly delegated to auth callout
+		// if configured.
+		if juc == nil && opts.AuthCallout != nil && c.acc.Name != globalAccountName {
+			// If no allowed accounts are defined, then all accounts are in scope.
+			// Otherwise see if the account is in the list.
+			delegated := len(opts.AuthCallout.AllowedAccounts) == 0
+			if !delegated {
+				for _, n := range opts.AuthCallout.AllowedAccounts {
+					if n == c.acc.Name {
+						delegated = true
+						break
+					}
+				}
+			}
+
+			// Not delegated, so return with previous authorized result.
+			if !delegated {
+				if !authorized {
+					s.sendAccountAuthErrorEvent(c, c.acc, reason)
+				}
+				return
+			}
 		}
 
 		// We have auth callout set here.
@@ -845,33 +883,6 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 	// If we have a jwt and a userClaim, make sure we have the Account, etc associated.
 	// We need to look up the account. This will use an account resolver if one is present.
 	if juc != nil {
-		allowedConnTypes, err := convertAllowedConnectionTypes(juc.AllowedConnectionTypes)
-		if err != nil {
-			// We got an error, which means some connection types were unknown. As long as
-			// a valid one is returned, we proceed with auth. If not, we have to reject.
-			// In other words, suppose that JWT allows "WEBSOCKET" in the array. No error
-			// is returned and allowedConnTypes will contain "WEBSOCKET" only.
-			// Client will be rejected if not a websocket client, or proceed with rest of
-			// auth if it is.
-			// Now suppose JWT allows "WEBSOCKET, MQTT" and say MQTT is not known by this
-			// server. In this case, allowedConnTypes would contain "WEBSOCKET" and we
-			// would get `err` indicating that "MQTT" is an unknown connection type.
-			// If a websocket client connects, it should still be allowed, since after all
-			// the admin wanted to allow websocket and mqtt connection types.
-			// However, say that the JWT only allows "MQTT" (and again suppose this server
-			// does not know about MQTT connection type), then since the allowedConnTypes
-			// map would be empty (no valid types found), and since empty means allow-all,
-			// then we should reject because the intent was to allow connections for this
-			// user only as an MQTT client.
-			c.Debugf("%v", err)
-			if len(allowedConnTypes) == 0 {
-				return false
-			}
-		}
-		if !c.connectionTypeAllowed(allowedConnTypes) {
-			c.Debugf("Connection type not allowed")
-			return false
-		}
 		issuer := juc.Issuer
 		if juc.IssuerAccount != _EMPTY_ {
 			issuer = juc.IssuerAccount
@@ -912,6 +923,36 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 		}
 		if juc.BearerToken && acc.failBearer() {
 			c.Debugf("Account does not allow bearer tokens")
+			return false
+		}
+		// We check the allowed connection types, but only after processing
+		// of scoped signer (so that it updates `juc` with what is defined
+		// in the account.
+		allowedConnTypes, err := convertAllowedConnectionTypes(juc.AllowedConnectionTypes)
+		if err != nil {
+			// We got an error, which means some connection types were unknown. As long as
+			// a valid one is returned, we proceed with auth. If not, we have to reject.
+			// In other words, suppose that JWT allows "WEBSOCKET" in the array. No error
+			// is returned and allowedConnTypes will contain "WEBSOCKET" only.
+			// Client will be rejected if not a websocket client, or proceed with rest of
+			// auth if it is.
+			// Now suppose JWT allows "WEBSOCKET, MQTT" and say MQTT is not known by this
+			// server. In this case, allowedConnTypes would contain "WEBSOCKET" and we
+			// would get `err` indicating that "MQTT" is an unknown connection type.
+			// If a websocket client connects, it should still be allowed, since after all
+			// the admin wanted to allow websocket and mqtt connection types.
+			// However, say that the JWT only allows "MQTT" (and again suppose this server
+			// does not know about MQTT connection type), then since the allowedConnTypes
+			// map would be empty (no valid types found), and since empty means allow-all,
+			// then we should reject because the intent was to allow connections for this
+			// user only as an MQTT client.
+			c.Debugf("%v", err)
+			if len(allowedConnTypes) == 0 {
+				return false
+			}
+		}
+		if !c.connectionTypeAllowed(allowedConnTypes) {
+			c.Debugf("Connection type not allowed")
 			return false
 		}
 		// skip validation of nonce when presented with a bearer token
@@ -966,12 +1007,12 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			deniedSub := []string{}
 			for _, sub := range denyAllJs {
 				if c.perms.pub.deny != nil {
-					if r := c.perms.pub.deny.Match(sub); len(r.psubs)+len(r.qsubs) > 0 {
+					if c.perms.pub.deny.HasInterest(sub) {
 						deniedPub = append(deniedPub, sub)
 					}
 				}
 				if c.perms.sub.deny != nil {
-					if r := c.perms.sub.deny.Match(sub); len(r.psubs)+len(r.qsubs) > 0 {
+					if c.perms.sub.deny.HasInterest(sub) {
 						deniedSub = append(deniedSub, sub)
 					}
 				}
@@ -1418,8 +1459,14 @@ func comparePasswords(serverPassword, clientPassword string) bool {
 		if err := bcrypt.CompareHashAndPassword([]byte(serverPassword), []byte(clientPassword)); err != nil {
 			return false
 		}
-	} else if serverPassword != clientPassword {
-		return false
+	} else {
+		// stringToBytes should be constant-time near enough compared to
+		// turning a string into []byte normally.
+		spass := stringToBytes(serverPassword)
+		cpass := stringToBytes(clientPassword)
+		if subtle.ConstantTimeCompare(spass, cpass) == 0 {
+			return false
+		}
 	}
 	return true
 }
@@ -1447,7 +1494,8 @@ func validateAllowedConnectionTypes(m map[string]struct{}) error {
 		switch ctuc {
 		case jwt.ConnectionTypeStandard, jwt.ConnectionTypeWebsocket,
 			jwt.ConnectionTypeLeafnode, jwt.ConnectionTypeLeafnodeWS,
-			jwt.ConnectionTypeMqtt, jwt.ConnectionTypeMqttWS:
+			jwt.ConnectionTypeMqtt, jwt.ConnectionTypeMqttWS,
+			jwt.ConnectionTypeInProcess:
 		default:
 			return fmt.Errorf("unknown connection type %q", ct)
 		}

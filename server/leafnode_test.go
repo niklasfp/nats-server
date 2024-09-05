@@ -46,7 +46,7 @@ type captureLeafNodeRandomIPLogger struct {
 	ips [3]int
 }
 
-func (c *captureLeafNodeRandomIPLogger) Debugf(format string, v ...interface{}) {
+func (c *captureLeafNodeRandomIPLogger) Debugf(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
 	if strings.Contains(msg, "hostname_to_resolve") {
 		ippos := strings.Index(msg, "127.0.0.")
@@ -340,7 +340,7 @@ type captureErrorLogger struct {
 	errCh chan string
 }
 
-func (l *captureErrorLogger) Errorf(format string, v ...interface{}) {
+func (l *captureErrorLogger) Errorf(format string, v ...any) {
 	select {
 	case l.errCh <- fmt.Sprintf(format, v...):
 	default:
@@ -822,7 +822,7 @@ type loopDetectedLogger struct {
 	ch chan string
 }
 
-func (l *loopDetectedLogger) Errorf(format string, v ...interface{}) {
+func (l *loopDetectedLogger) Errorf(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
 	if strings.Contains(msg, "Loop") {
 		select {
@@ -837,6 +837,7 @@ func TestLeafNodeLoop(t *testing.T) {
 		// This test requires that we set the port to known value because
 		// we want A point to B and B to A.
 		oa := DefaultOptions()
+		oa.ServerName = "A"
 		if !cluster {
 			oa.Cluster.Port = 0
 			oa.Cluster.Name = _EMPTY_
@@ -849,10 +850,11 @@ func TestLeafNodeLoop(t *testing.T) {
 		sa := RunServer(oa)
 		defer sa.Shutdown()
 
-		l := &loopDetectedLogger{ch: make(chan string, 1)}
-		sa.SetLogger(l, false, false)
+		la := &loopDetectedLogger{ch: make(chan string, 1)}
+		sa.SetLogger(la, false, false)
 
 		ob := DefaultOptions()
+		ob.ServerName = "B"
 		if !cluster {
 			ob.Cluster.Port = 0
 			ob.Cluster.Name = _EMPTY_
@@ -867,10 +869,15 @@ func TestLeafNodeLoop(t *testing.T) {
 		sb := RunServer(ob)
 		defer sb.Shutdown()
 
+		lb := &loopDetectedLogger{ch: make(chan string, 1)}
+		sb.SetLogger(lb, false, false)
+
 		select {
-		case <-l.ch:
+		case <-la.ch:
 			// OK!
-		case <-time.After(2 * time.Second):
+		case <-lb.ch:
+			// OK!
+		case <-time.After(5 * time.Second):
 			t.Fatalf("Did not get any error regarding loop")
 		}
 
@@ -892,6 +899,7 @@ func TestLeafNodeLoopFromDAG(t *testing.T) {
 	// We need to cancel clustering since now this will suppress on its own.
 	oa := DefaultOptions()
 	oa.ServerName = "A"
+	oa.LeafNode.connDelay = 50 * time.Millisecond
 	oa.LeafNode.ReconnectInterval = 10 * time.Millisecond
 	oa.LeafNode.Port = -1
 	oa.Cluster = ClusterOpts{}
@@ -903,6 +911,7 @@ func TestLeafNodeLoopFromDAG(t *testing.T) {
 	// B will point to A
 	ob := DefaultOptions()
 	ob.ServerName = "B"
+	ob.LeafNode.connDelay = 50 * time.Millisecond
 	ob.LeafNode.ReconnectInterval = 10 * time.Millisecond
 	ob.LeafNode.Port = -1
 	ob.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{ua}}}
@@ -918,6 +927,7 @@ func TestLeafNodeLoopFromDAG(t *testing.T) {
 	// C will point to A and B
 	oc := DefaultOptions()
 	oc.ServerName = "C"
+	oc.LeafNode.connDelay = 50 * time.Millisecond
 	oc.LeafNode.ReconnectInterval = 10 * time.Millisecond
 	oc.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{ua}}, {URLs: []*url.URL{ub}}}
 	oc.LeafNode.connDelay = 100 * time.Millisecond // Allow logger to be attached before connecting.
@@ -944,6 +954,7 @@ func TestLeafNodeLoopFromDAG(t *testing.T) {
 	// Shutdown C and restart without the loop.
 	sc.Shutdown()
 	oc.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{ub}}}
+
 	sc = RunServer(oc)
 	defer sc.Shutdown()
 
@@ -1793,11 +1804,11 @@ type chanLogger struct {
 	triggerChan chan string
 }
 
-func (l *chanLogger) Warnf(format string, v ...interface{}) {
+func (l *chanLogger) Warnf(format string, v ...any) {
 	l.triggerChan <- fmt.Sprintf(format, v...)
 }
 
-func (l *chanLogger) Errorf(format string, v ...interface{}) {
+func (l *chanLogger) Errorf(format string, v ...any) {
 	l.triggerChan <- fmt.Sprintf(format, v...)
 }
 
@@ -2113,14 +2124,14 @@ type oldConnReplacedLogger struct {
 	warnCh chan string
 }
 
-func (l *oldConnReplacedLogger) Errorf(format string, v ...interface{}) {
+func (l *oldConnReplacedLogger) Errorf(format string, v ...any) {
 	select {
 	case l.errCh <- fmt.Sprintf(format, v...):
 	default:
 	}
 }
 
-func (l *oldConnReplacedLogger) Warnf(format string, v ...interface{}) {
+func (l *oldConnReplacedLogger) Warnf(format string, v ...any) {
 	select {
 	case l.warnCh <- fmt.Sprintf(format, v...):
 	default:
@@ -2450,7 +2461,7 @@ type parseRouteLSUnsubLogger struct {
 	gotErr   chan error
 }
 
-func (l *parseRouteLSUnsubLogger) Errorf(format string, v ...interface{}) {
+func (l *parseRouteLSUnsubLogger) Errorf(format string, v ...any) {
 	err := fmt.Errorf(format, v...)
 	select {
 	case l.gotErr <- err:
@@ -2458,7 +2469,7 @@ func (l *parseRouteLSUnsubLogger) Errorf(format string, v ...interface{}) {
 	}
 }
 
-func (l *parseRouteLSUnsubLogger) Tracef(format string, v ...interface{}) {
+func (l *parseRouteLSUnsubLogger) Tracef(format string, v ...any) {
 	trace := fmt.Sprintf(format, v...)
 	if strings.Contains(trace, "LS- $G foo bar") {
 		l.gotTrace <- struct{}{}
@@ -4236,7 +4247,7 @@ type checkLeafMinVersionLogger struct {
 	connCh chan string
 }
 
-func (l *checkLeafMinVersionLogger) Errorf(format string, args ...interface{}) {
+func (l *checkLeafMinVersionLogger) Errorf(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	if strings.Contains(msg, "minimum version") {
 		select {
@@ -4246,7 +4257,7 @@ func (l *checkLeafMinVersionLogger) Errorf(format string, args ...interface{}) {
 	}
 }
 
-func (l *checkLeafMinVersionLogger) Noticef(format string, args ...interface{}) {
+func (l *checkLeafMinVersionLogger) Noticef(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	if strings.Contains(msg, "Leafnode connection created") {
 		select {
@@ -4610,7 +4621,7 @@ type testLeafTraceLogger struct {
 	ch chan string
 }
 
-func (l *testLeafTraceLogger) Tracef(format string, v ...interface{}) {
+func (l *testLeafTraceLogger) Tracef(format string, v ...any) {
 	msg := fmt.Sprintf(format, v...)
 	// We will sub to 'baz' and to 'bar', so filter on 'ba' prefix.
 	if strings.Contains(msg, "[LS+ ba") {
@@ -4943,6 +4954,59 @@ func TestLeafNodeTLSHandshakeFirstVerifyNoInfoSent(t *testing.T) {
 	}
 }
 
+func TestLeafNodeTLSHandshakeFirstFallbackDelayConfigValues(t *testing.T) {
+	tmpl := `
+		listen: "127.0.0.1:-1"
+		leafnodes {
+			listen: "127.0.0.1:-1"
+			tls {
+				cert_file: 	"../test/configs/certs/server-cert.pem"
+				key_file:  	"../test/configs/certs/server-key.pem"
+				timeout: 	1
+				first: 		%s
+			}
+		}
+	`
+	for _, test := range []struct {
+		name  string
+		val   string
+		first bool
+		delay time.Duration
+	}{
+		{"first as boolean true", "true", true, 0},
+		{"first as boolean false", "false", false, 0},
+		{"first as string true", "\"true\"", true, 0},
+		{"first as string false", "\"false\"", false, 0},
+		{"first as string on", "on", true, 0},
+		{"first as string off", "off", false, 0},
+		{"first as string auto", "auto", true, DEFAULT_TLS_HANDSHAKE_FIRST_FALLBACK_DELAY},
+		{"first as string auto_fallback", "auto_fallback", true, DEFAULT_TLS_HANDSHAKE_FIRST_FALLBACK_DELAY},
+		{"first as fallback duration", "300ms", true, 300 * time.Millisecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, test.val)))
+			s, o := RunServerWithConfig(conf)
+			defer s.Shutdown()
+
+			if test.first {
+				if !o.LeafNode.TLSHandshakeFirst {
+					t.Fatal("Expected tls first to be true, was not")
+				}
+				if test.delay != o.LeafNode.TLSHandshakeFirstFallback {
+					t.Fatalf("Expected fallback delay to be %v, got %v", test.delay, o.LeafNode.TLSHandshakeFirstFallback)
+				}
+			} else {
+				if o.LeafNode.TLSHandshakeFirst {
+					t.Fatal("Expected tls first to be false, was not")
+				}
+				if o.LeafNode.TLSHandshakeFirstFallback != 0 {
+					t.Fatalf("Expected fallback delay to be 0, got %v", o.LeafNode.TLSHandshakeFirstFallback)
+				}
+			}
+		})
+	}
+}
+
 func TestLeafNodeTLSHandshakeFirst(t *testing.T) {
 	tmpl1 := `
 		port : -1
@@ -5037,6 +5101,18 @@ func TestLeafNodeTLSHandshakeFirst(t *testing.T) {
 
 	// Reload again with "true"
 	reloadUpdateConfig(t, s1, confHub, fmt.Sprintf(tmpl1, "true"))
+	checkLeafNodeConnected(t, s2)
+
+	// Shutdown the remote
+	s2.Shutdown()
+
+	// Reload the hub with handshake_first with a duration
+	reloadUpdateConfig(t, s1, confHub, fmt.Sprintf(tmpl1, `"250ms"`))
+
+	// Now start s2 with a remote that does not use handshake_first (set to false)
+	confSpoke = createConfFile(t, []byte(fmt.Sprintf(tmpl2, o1.LeafNode.Port, "false")))
+	s2, _ = RunServerWithConfig(confSpoke)
+	defer s2.Shutdown()
 	checkLeafNodeConnected(t, s2)
 }
 
@@ -7414,9 +7490,7 @@ func TestLeafNodeServerReloadSubjectMappingsWithSameSubject(t *testing.T) {
 		listen: 127.0.0.1:-1
 		server_name: test-leaf
 		leaf {
-			remotes: [ {
-				urls: [ nats-leaf://127.0.0.1:{LEAF_PORT} ]
-			} ]
+			remotes: [ { urls: [ nats-leaf://127.0.0.1:{LEAF_PORT} ] } ]
 		}
 	`
 	tmpl = strings.Replace(tmpl, "{LEAF_PORT}", fmt.Sprintf("%d", o.LeafNode.Port), 1)
@@ -7446,6 +7520,7 @@ func TestLeafNodeServerReloadSubjectMappingsWithSameSubject(t *testing.T) {
 
 	// Now change mapping, but only the "to" subject, keeping same "from"
 	reloadUpdateConfig(t, s, conf, strings.Replace(stmpl, "target1", "target2", 1))
+	checkLeafNodeConnected(t, l)
 
 	// Publish our new message.
 	ncl.Publish("source", []byte("OK"))
@@ -7516,4 +7591,380 @@ func TestLeafNodeAccountNkeysAuth(t *testing.T) {
 	defer l.Shutdown()
 
 	checkLeafNodeConnected(t, l)
+}
+
+// https://github.com/nats-io/nats-server/issues/5117
+func TestLeafNodeLoopDetectionOnActualLoop(t *testing.T) {
+	// Setup:  B --[leaf]--> A    C --[leaf]--> A    C --[leaf] --> B
+	accConf := `
+		accounts: {
+			APP: {
+				users: [ { user:u, password: u,
+					permissions: { publish = "u.>", subscribe = "u.>" }} ]
+			}
+			$SYS: { users = [ {user: "s", password: "s"} ] }
+		}`
+
+	confA := createConfFile(t, []byte(fmt.Sprintf(`
+		server_name: a1
+		port: -1
+		cluster: { name: A }
+		leafnodes {
+			port: 17422
+		}
+		%s`, accConf)))
+
+	confB := createConfFile(t, []byte(fmt.Sprintf(`
+		server_name: b1
+		port: -1
+		cluster: { name: B }
+		leafnodes {
+			port: 17432
+			remotes [
+				{ urls: ["nats-leaf://u:u@localhost:17422"], account: "APP" }
+			]
+			reconnect: "2s"
+		}
+		%s`, accConf)))
+
+	confC := createConfFile(t, []byte(fmt.Sprintf(`
+		server_name: c1
+		port: -1
+		cluster: { name: C }
+		leafnodes {
+			port: 17442
+			remotes [
+				{ urls: ["nats-leaf://u:u@localhost:17422"], account: "APP" }
+				# This one creates the loop
+				{ urls: ["nats-leaf://u:u@localhost:17432"], account: "APP" }
+			]
+			reconnect: "0.5s"
+		}
+		%s`, accConf)))
+
+	// Start order will be B -> C -> A
+	// We will force C to connect to A first before B using different reconnect intervals.
+	// If B connects first we detect loops fine. If C connects first we do not.
+
+	srvB, _ := RunServerWithConfig(confB)
+	defer srvB.Shutdown()
+	lb := &loopDetectedLogger{ch: make(chan string, 1)}
+	srvB.SetLogger(lb, false, false)
+
+	srvC, _ := RunServerWithConfig(confC)
+	defer srvC.Shutdown()
+	lc := &loopDetectedLogger{ch: make(chan string, 1)}
+	srvC.SetLogger(lc, false, false)
+
+	// C should connect to B
+	checkLeafNodeConnectedCount(t, srvC, 1)
+
+	srvA, _ := RunServerWithConfig(confA)
+	defer srvA.Shutdown()
+	la := &loopDetectedLogger{ch: make(chan string, 1)}
+	srvA.SetLogger(la, false, false)
+
+	select {
+	case <-la.ch:
+	case <-lb.ch:
+	case <-lc.ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Did not get any error regarding loop")
+	}
+}
+
+func TestLeafNodeConnectionSucceedsEvenWithDelayedFirstINFO(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		websocket bool
+	}{
+		{"regular", false},
+		{"websocket", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ob := DefaultOptions()
+			ob.ServerName = "HUB"
+			ob.LeafNode.Host = "127.0.0.1"
+			ob.LeafNode.Port = -1
+			ob.LeafNode.AuthTimeout = 10
+			if test.websocket {
+				ob.Websocket.Host = "127.0.0.1"
+				ob.Websocket.Port = -1
+				ob.Websocket.HandshakeTimeout = 10 * time.Second
+				ob.Websocket.AuthTimeout = 10
+				ob.Websocket.NoTLS = true
+			}
+			sb := RunServer(ob)
+			defer sb.Shutdown()
+
+			var port int
+			var scheme string
+			if test.websocket {
+				port = ob.Websocket.Port
+				scheme = wsSchemePrefix
+			} else {
+				port = ob.LeafNode.Port
+				scheme = "nats"
+			}
+
+			urlStr := fmt.Sprintf("%s://127.0.0.1:%d", scheme, port)
+			proxy := createNetProxy(1100*time.Millisecond, 1024*1024*1024, 1024*1024*1024, urlStr, true)
+			defer proxy.stop()
+			proxyURL := proxy.clientURL()
+			_, proxyPort, err := net.SplitHostPort(proxyURL[len(scheme)+3:])
+			require_NoError(t, err)
+
+			lnBURL, err := url.Parse(fmt.Sprintf("%s://127.0.0.1:%s", scheme, proxyPort))
+			require_NoError(t, err)
+
+			oa := DefaultOptions()
+			oa.ServerName = "SPOKE"
+			oa.Cluster.Name = "xyz"
+			remote := &RemoteLeafOpts{
+				URLs:             []*url.URL{lnBURL},
+				FirstInfoTimeout: 3 * time.Second,
+			}
+			oa.LeafNode.Remotes = []*RemoteLeafOpts{remote}
+			sa := RunServer(oa)
+			defer sa.Shutdown()
+
+			checkLeafNodeConnected(t, sa)
+		})
+	}
+}
+
+type captureLeafConnClosed struct {
+	DummyLogger
+	ch chan struct{}
+}
+
+func (l *captureLeafConnClosed) Noticef(format string, v ...any) {
+	msg := fmt.Sprintf(format, v...)
+	if strings.Contains(msg, "Leafnode connection closed: Read Error") {
+		select {
+		case l.ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func TestLeafNodeDetectsStaleConnectionIfNoInfo(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		websocket bool
+	}{
+		{"regular", false},
+		{"websocket", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			require_NoError(t, err)
+			defer l.Close()
+
+			ch := make(chan struct{})
+			wg := sync.WaitGroup{}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				c, err := l.Accept()
+				if err != nil {
+					return
+				}
+				defer c.Close()
+				<-ch
+			}()
+
+			var scheme string
+			if test.websocket {
+				scheme = wsSchemePrefix
+			} else {
+				scheme = "nats"
+			}
+			urlStr := fmt.Sprintf("%s://%s", scheme, l.Addr())
+			lnBURL, err := url.Parse(urlStr)
+			require_NoError(t, err)
+
+			oa := DefaultOptions()
+			oa.ServerName = "SPOKE"
+			oa.Cluster.Name = "xyz"
+			remote := &RemoteLeafOpts{
+				URLs:             []*url.URL{lnBURL},
+				FirstInfoTimeout: 250 * time.Millisecond,
+			}
+			oa.LeafNode.Remotes = []*RemoteLeafOpts{remote}
+			oa.DisableShortFirstPing = false
+			oa.NoLog = false
+			sa, err := NewServer(oa)
+			require_NoError(t, err)
+			defer sa.Shutdown()
+
+			log := &captureLeafConnClosed{ch: make(chan struct{}, 1)}
+			sa.SetLogger(log, false, false)
+			sa.Start()
+
+			select {
+			case <-log.ch:
+				// OK
+			case <-time.After(750 * time.Millisecond):
+				t.Fatalf("Connection was not closed")
+			}
+
+			sa.Shutdown()
+			close(ch)
+			wg.Wait()
+			sa.WaitForShutdown()
+		})
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/5473
+func TestLeafNodeDupeDeliveryQueueSubAndPlainSub(t *testing.T) {
+	clusterCommonConf := `
+		accounts: {
+			tenant: {
+				users: [ { user:t, password: t } ]
+				exports: [{stream: system-a.events.>}]
+			}
+			system-a: {
+				users: [ { user:sa, password: sa } ]
+				imports: [
+					{stream: {subject: system-a.events.>, account: tenant}, prefix: tenant}
+				]
+			}
+			$SYS: { users = [ {user: "s", password: "s"} ] }
+		}
+		leafnodes {
+			remotes: [{
+				urls: [ "nats-leaf://sa:sa@127.0.0.1:17422" ]
+				account: system-a
+			}]
+		}`
+
+	confCluster0 := createConfFile(t, []byte(fmt.Sprintf(`
+		server_name: a-0
+		port: -1
+		cluster: {
+			name: cluster-a
+			listen: 127.0.0.1:16122
+			routes = [ nats://127.0.0.1:16123 ]
+			pool_size: -1
+		}
+		%s`, clusterCommonConf)))
+
+	confCluster1 := createConfFile(t, []byte(fmt.Sprintf(`
+		server_name: a-1
+		port: -1
+		cluster: {
+			name: cluster-a
+			listen: 127.0.0.1:16123
+			routes = [ nats://127.0.0.1:16122 ]
+			pool_size: -1
+		}
+		%s`, clusterCommonConf)))
+
+	serverB := createConfFile(t, []byte(`
+		server_name: b
+		port: -1
+		leafnodes: { port: 17422 }
+		accounts: {
+			system-a: {
+				users: [ { user: sa, password: sa } ]
+				exports: [{stream: *.system-a.>}]
+			}
+			system-b: {
+				users: [ { user: sb, password: sb } ]
+				imports: [ {stream: {subject: *.system-a.>, account: system-a }}]
+			}
+			$SYS: { users = [ {user: "s", password: "s"} ] }
+		}`))
+
+	// Start server B
+	srvB, _ := RunServerWithConfig(serverB)
+	defer srvB.Shutdown()
+
+	// Start the cluster servers.
+	srvA0, _ := RunServerWithConfig(confCluster0)
+	defer srvA0.Shutdown()
+	// Make sure this is connected first before starting the second server in cluster A.
+	checkLeafNodeConnectedCount(t, srvB, 1)
+	// Start second A server.
+	srvA1, _ := RunServerWithConfig(confCluster1)
+	defer srvA1.Shutdown()
+	// Make sure they are routed together.
+	checkNumRoutes(t, srvA0, 1)
+	checkNumRoutes(t, srvA1, 1)
+	// Make sure each cluster server is connected to server B.
+	checkLeafNodeConnectedCount(t, srvB, 2)
+
+	// Create plain subscriber on server B attached to system-b account.
+	ncB := natsConnect(t, srvB.ClientURL(), nats.UserInfo("sb", "sb"))
+	defer ncB.Close()
+	sub, err := ncB.SubscribeSync("*.system-a.events.>")
+	require_NoError(t, err)
+	// Create a new sub that has a queue group as well.
+	subq, err := ncB.QueueSubscribeSync("*.system-a.events.objectnotfound", "SYSB")
+	require_NoError(t, err)
+	ncB.Flush()
+	time.Sleep(250 * time.Millisecond)
+
+	// Connect to cluster A
+	ncA := natsConnect(t, srvA0.ClientURL(), nats.UserInfo("t", "t"))
+	defer ncA.Close()
+
+	err = ncA.Publish("system-a.events.objectnotfound", []byte("EventA"))
+	require_NoError(t, err)
+	ncA.Flush()
+	// Wait for them to be received.
+	time.Sleep(250 * time.Millisecond)
+
+	n, _, err := sub.Pending()
+	require_NoError(t, err)
+	require_Equal(t, n, 1)
+	n, _, err = subq.Pending()
+	require_NoError(t, err)
+	require_Equal(t, n, 1)
+}
+
+func TestLeafNodeServerKickClient(t *testing.T) {
+	stmpl := `
+		listen: 127.0.0.1:-1
+		server_name: test-server
+		leaf { listen: 127.0.0.1:-1 }
+	`
+	conf := createConfFile(t, []byte(stmpl))
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	tmpl := `
+		listen: 127.0.0.1:-1
+		server_name: test-leaf
+		leaf { remotes: [ { urls: [ nats-leaf://127.0.0.1:{LEAF_PORT} ] } ] }
+	`
+	tmpl = strings.Replace(tmpl, "{LEAF_PORT}", fmt.Sprintf("%d", o.LeafNode.Port), 1)
+	lConf := createConfFile(t, []byte(tmpl))
+	l, _ := RunServerWithConfig(lConf)
+	defer l.Shutdown()
+
+	checkLeafNodeConnected(t, l)
+
+	// We want to make sure we can kick the leafnode connections as well as client connections.
+	conns, err := s.Connz(&ConnzOptions{Account: globalAccountName})
+	require_NoError(t, err)
+	require_Equal(t, len(conns.Conns), 1)
+	lid := conns.Conns[0].Cid
+
+	disconnectTime := time.Now()
+	err = s.DisconnectClientByID(lid)
+	require_NoError(t, err)
+
+	// Wait until we are reconnected.
+	checkLeafNodeConnected(t, s)
+
+	// Look back up again and make sure start time indicates a restart, meaning kick worked.
+	conns, err = s.Connz(&ConnzOptions{Account: globalAccountName})
+	require_NoError(t, err)
+	require_Equal(t, len(conns.Conns), 1)
+	ln := conns.Conns[0]
+	require_True(t, lid != ln.Cid)
+	require_True(t, ln.Start.After(disconnectTime))
 }

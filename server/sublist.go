@@ -504,7 +504,7 @@ func (s *Sublist) addToCache(subject string, sub *subscription) {
 
 // removeFromCache will remove the sub from any active cache entries.
 // Assumes write lock is held.
-func (s *Sublist) removeFromCache(subject string, sub *subscription) {
+func (s *Sublist) removeFromCache(subject string) {
 	if s.cache == nil {
 		return
 	}
@@ -527,14 +527,26 @@ var emptyResult = &SublistResult{}
 // Match will match all entries to the literal subject.
 // It will return a set of results for both normal and queue subscribers.
 func (s *Sublist) Match(subject string) *SublistResult {
-	return s.match(subject, true)
+	return s.match(subject, true, false)
+}
+
+// MatchBytes will match all entries to the literal subject.
+// It will return a set of results for both normal and queue subscribers.
+func (s *Sublist) MatchBytes(subject []byte) *SublistResult {
+	return s.match(bytesToString(subject), true, true)
+}
+
+// HasInterest will return whether or not there is any interest in the subject.
+// In cases where more detail is not required, this may be faster than Match.
+func (s *Sublist) HasInterest(subject string) bool {
+	return s.hasInterest(subject, true)
 }
 
 func (s *Sublist) matchNoLock(subject string) *SublistResult {
-	return s.match(subject, false)
+	return s.match(subject, false, false)
 }
 
-func (s *Sublist) match(subject string, doLock bool) *SublistResult {
+func (s *Sublist) match(subject string, doLock bool, doCopyOnCache bool) *SublistResult {
 	atomic.AddUint64(&s.matches, 1)
 
 	// Check cache first.
@@ -589,6 +601,9 @@ func (s *Sublist) match(subject string, doLock bool) *SublistResult {
 		result = emptyResult
 	}
 	if cacheEnabled {
+		if doCopyOnCache {
+			subject = copyString(subject)
+		}
 		s.cache[subject] = result
 		n = len(s.cache)
 	}
@@ -606,6 +621,49 @@ func (s *Sublist) match(subject string, doLock bool) *SublistResult {
 	}
 
 	return result
+}
+
+func (s *Sublist) hasInterest(subject string, doLock bool) bool {
+	// Check cache first.
+	if doLock {
+		s.RLock()
+	}
+	var matched bool
+	if s.cache != nil {
+		if r, ok := s.cache[subject]; ok {
+			matched = len(r.psubs)+len(r.qsubs) > 0
+		}
+	}
+	if doLock {
+		s.RUnlock()
+	}
+	if matched {
+		atomic.AddUint64(&s.cacheHits, 1)
+		return true
+	}
+
+	tsa := [32]string{}
+	tokens := tsa[:0]
+	start := 0
+	for i := 0; i < len(subject); i++ {
+		if subject[i] == btsep {
+			if i-start == 0 {
+				return false
+			}
+			tokens = append(tokens, subject[start:i])
+			start = i + 1
+		}
+	}
+	if start >= len(subject) {
+		return false
+	}
+	tokens = append(tokens, subject[start:])
+
+	if doLock {
+		s.RLock()
+		defer s.RUnlock()
+	}
+	return matchLevelForAny(s.root, tokens)
 }
 
 // Remove entries in the cache until we are under the maximum.
@@ -635,7 +693,7 @@ func (s *Sublist) UpdateRemoteQSub(sub *subscription) {
 	// it unless we are thrashing the cache. Just remove from our L2 and update
 	// the genid so L1 will be flushed.
 	s.Lock()
-	s.removeFromCache(string(sub.subject), sub)
+	s.removeFromCache(string(sub.subject))
 	atomic.AddUint64(&s.genid, 1)
 	s.Unlock()
 }
@@ -720,6 +778,36 @@ func matchLevel(l *level, toks []string, results *SublistResult) {
 	}
 }
 
+func matchLevelForAny(l *level, toks []string) bool {
+	var pwc, n *node
+	for i, t := range toks {
+		if l == nil {
+			return false
+		}
+		if l.fwc != nil {
+			return true
+		}
+		if pwc = l.pwc; pwc != nil {
+			if match := matchLevelForAny(pwc.next, toks[i+1:]); match {
+				return true
+			}
+		}
+		n = l.nodes[t]
+		if n != nil {
+			l = n.next
+		} else {
+			l = nil
+		}
+	}
+	if n != nil {
+		return len(n.plist) > 0 || len(n.psubs) > 0 || len(n.qsubs) > 0
+	}
+	if pwc != nil {
+		return len(pwc.plist) > 0 || len(pwc.psubs) > 0 || len(pwc.qsubs) > 0
+	}
+	return false
+}
+
 // lnt is used to track descent into levels for a removal for pruning.
 type lnt struct {
 	l *level
@@ -798,7 +886,7 @@ func (s *Sublist) remove(sub *subscription, shouldLock bool, doCacheUpdates bool
 		}
 	}
 	if doCacheUpdates {
-		s.removeFromCache(subject, sub)
+		s.removeFromCache(subject)
 		atomic.AddUint64(&s.genid, 1)
 	}
 
@@ -1146,12 +1234,12 @@ func isValidLiteralSubject(tokens []string) bool {
 	return true
 }
 
-// ValidateMappingDestination returns nil error if the subject is a valid subject mapping destination subject
-func ValidateMappingDestination(subject string) error {
-	if subject == _EMPTY_ {
+// ValidateMapping returns nil error if the subject is a valid subject mapping destination subject
+func ValidateMapping(src string, dest string) error {
+	if dest == _EMPTY_ {
 		return nil
 	}
-	subjectTokens := strings.Split(subject, tsep)
+	subjectTokens := strings.Split(dest, tsep)
 	sfwc := false
 	for _, t := range subjectTokens {
 		length := len(t)
@@ -1159,6 +1247,7 @@ func ValidateMappingDestination(subject string) error {
 			return &mappingDestinationErr{t, ErrInvalidMappingDestinationSubject}
 		}
 
+		// if it looks like it contains a mapping function, it should be a valid mapping function
 		if length > 4 && t[0] == '{' && t[1] == '{' && t[length-2] == '}' && t[length-1] == '}' {
 			if !partitionMappingFunctionRegEx.MatchString(t) &&
 				!wildcardMappingFunctionRegEx.MatchString(t) &&
@@ -1179,7 +1268,10 @@ func ValidateMappingDestination(subject string) error {
 			return ErrInvalidMappingDestinationSubject
 		}
 	}
-	return nil
+
+	// Finally, verify that the transform can actually be created from the source and destination
+	_, err := NewSubjectTransform(src, dest)
+	return err
 }
 
 // Will check tokens and report back if the have any partial or full wildcards.

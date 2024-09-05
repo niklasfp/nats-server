@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The NATS Authors
+// Copyright 2020-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -38,10 +38,13 @@ import (
 func init() {
 	// Speed up raft for tests.
 	hbInterval = 50 * time.Millisecond
-	minElectionTimeout = 750 * time.Millisecond
-	maxElectionTimeout = 2500 * time.Millisecond
-	lostQuorumInterval = 500 * time.Millisecond
+	minElectionTimeout = 1500 * time.Millisecond
+	maxElectionTimeout = 3500 * time.Millisecond
+	lostQuorumInterval = 2 * time.Second
 	lostQuorumCheck = 4 * hbInterval
+
+	// For statz and jetstream placement speedups as well.
+	statszRateLimit = 0
 }
 
 // Used to setup clusters of clusters for tests.
@@ -1184,13 +1187,17 @@ func jsClientConnect(t testing.TB, s *Server, opts ...nats.Option) (*nats.Conn, 
 	return nc, js
 }
 
-func jsClientConnectEx(t testing.TB, s *Server, domain string, opts ...nats.Option) (*nats.Conn, nats.JetStreamContext) {
+func jsClientConnectEx(t testing.TB, s *Server, jsOpts []nats.JSOpt, opts ...nats.Option) (*nats.Conn, nats.JetStreamContext) {
 	t.Helper()
 	nc, err := nats.Connect(s.ClientURL(), opts...)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	js, err := nc.JetStream(nats.MaxWait(10*time.Second), nats.Domain(domain))
+	jo := []nats.JSOpt{nats.MaxWait(10 * time.Second)}
+	if len(jsOpts) > 0 {
+		jo = append(jo, jsOpts...)
+	}
+	js, err := nc.JetStream(jo...)
 	if err != nil {
 		t.Fatalf("Unexpected error getting JetStream context: %v", err)
 	}
@@ -1477,6 +1484,7 @@ func (c *cluster) waitOnAccount(account string) {
 func (c *cluster) waitOnClusterReady() {
 	c.t.Helper()
 	c.waitOnClusterReadyWithNumPeers(len(c.servers))
+	c.waitOnLeader()
 }
 
 func (c *cluster) waitOnClusterReadyWithNumPeers(numPeersExpected int) {
@@ -1607,6 +1615,36 @@ func (c *cluster) stableTotalSubs() (total int) {
 	})
 	return nsubs
 
+}
+
+func addStreamPedanticWithError(t *testing.T, nc *nats.Conn, cfg *StreamConfigRequest) (*StreamInfo, *ApiError) {
+	t.Helper()
+	req, err := json.Marshal(cfg)
+	require_NoError(t, err)
+	rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, 5*time.Second)
+	require_NoError(t, err)
+	var resp JSApiStreamCreateResponse
+	err = json.Unmarshal(rmsg.Data, &resp)
+	require_NoError(t, err)
+	if resp.Type != JSApiStreamCreateResponseType {
+		t.Fatalf("Invalid response type %s expected %s", resp.Type, JSApiStreamCreateResponseType)
+	}
+	return resp.StreamInfo, resp.Error
+}
+
+func updateStreamPedanticWithError(t *testing.T, nc *nats.Conn, cfg *StreamConfigRequest) (*StreamInfo, *ApiError) {
+	t.Helper()
+	req, err := json.Marshal(cfg)
+	require_NoError(t, err)
+	rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamUpdateT, cfg.Name), req, time.Second)
+	require_NoError(t, err)
+	var resp JSApiStreamCreateResponse
+	err = json.Unmarshal(rmsg.Data, &resp)
+	require_NoError(t, err)
+	if resp.Type != JSApiStreamUpdateResponseType {
+		t.Fatalf("Invalid response type %s expected %s", resp.Type, JSApiStreamUpdateResponseType)
+	}
+	return resp.StreamInfo, resp.Error
 }
 
 func addStream(t *testing.T, nc *nats.Conn, cfg *StreamConfig) *StreamInfo {

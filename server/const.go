@@ -14,6 +14,8 @@
 package server
 
 import (
+	"regexp"
+	"runtime/debug"
 	"time"
 )
 
@@ -33,11 +35,26 @@ const (
 )
 
 var (
-	// gitCommit injected at build
-	gitCommit string
+	// gitCommit and serverVersion injected at build.
+	gitCommit, serverVersion string
 	// trustedKeys is a whitespace separated array of trusted operator's public nkeys.
 	trustedKeys string
+	// SemVer regexp to validate the VERSION.
+	semVerRe = regexp.MustCompile(`^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$`)
 )
+
+func init() {
+	// Use build info if present, it would be if building using 'go build .'
+	// or when using a release.
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				gitCommit = setting.Value[:7]
+			}
+		}
+	}
+}
 
 const (
 	// VERSION is the current version for the server.
@@ -217,10 +234,4 @@ const (
 
 	// DEFAULT_FETCH_TIMEOUT is the default time that the system will wait for an account fetch to return.
 	DEFAULT_ACCOUNT_FETCH_TIMEOUT = 1900 * time.Millisecond
-)
-
-// For direct get batch requests.
-const (
-	dg  = "NATS/1.0\r\nNats-Stream: %s\r\nNats-Subject: %s\r\nNats-Sequence: %d\r\nNats-Time-Stamp: %s\r\n\r\n"
-	dgb = "NATS/1.0\r\nNats-Stream: %s\r\nNats-Subject: %s\r\nNats-Sequence: %d\r\nNats-Time-Stamp: %s\r\nNats-Num-Pending: %d\r\nNats-Last-Sequence: %d\r\n\r\n"
 )

@@ -1,4 +1,4 @@
-// Copyright 2018-2023 The NATS Authors
+// Copyright 2018-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -68,7 +68,7 @@ func createUserCredsEx(t *testing.T, nuc *jwt.UserClaims, akp nkeys.KeyPair) nat
 	return nats.UserJWT(userCB, sigCB)
 }
 
-func createUserCreds(t *testing.T, s *Server, akp nkeys.KeyPair) nats.Option {
+func createUserCreds(t *testing.T, _ *Server, akp nkeys.KeyPair) nats.Option {
 	return createUserCredsEx(t, jwt.NewUserClaims("test"), akp)
 }
 
@@ -103,14 +103,14 @@ func runTrustedCluster(t *testing.T) (*Server, *Options, *Server, *Options, nkey
 	mr.Store(apub, jwt)
 
 	optsA := DefaultOptions()
-	optsA.Cluster.Name = "TEST CLUSTER 22"
+	optsA.Cluster.Name = "TEST_CLUSTER_22"
 	optsA.Cluster.Host = "127.0.0.1"
 	optsA.TrustedKeys = []string{pub}
 	optsA.AccountResolver = mr
 	optsA.SystemAccount = apub
 	optsA.ServerName = "A_SRV"
 	// Add in dummy gateway
-	optsA.Gateway.Name = "TEST CLUSTER 22"
+	optsA.Gateway.Name = "TEST_CLUSTER_22"
 	optsA.Gateway.Host = "127.0.0.1"
 	optsA.Gateway.Port = -1
 	optsA.gatewaysSolicitDelay = 30 * time.Second
@@ -1674,8 +1674,8 @@ func TestSystemAccountWithGateways(t *testing.T) {
 	nca.Flush()
 
 	// If this tests fails with wrong number after 10 seconds we may have
-	// added a new inititial subscription for the eventing system.
-	checkExpectedSubs(t, 56, sa)
+	// added a new initial subscription for the eventing system.
+	checkExpectedSubs(t, 58, sa)
 
 	// Create a client on B and see if we receive the event
 	urlb := fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port)
@@ -1876,7 +1876,7 @@ func TestServerEventsStatsZ(t *testing.T) {
 	if m.Server.ID != sa.ID() {
 		t.Fatalf("Did not match IDs")
 	}
-	if m.Server.Cluster != "TEST CLUSTER 22" {
+	if m.Server.Cluster != "TEST_CLUSTER_22" {
 		t.Fatalf("Did not match cluster name")
 	}
 	if m.Server.Version != VERSION {
@@ -1888,8 +1888,8 @@ func TestServerEventsStatsZ(t *testing.T) {
 	if m.Stats.Connections != 1 {
 		t.Fatalf("Did not match connections of 1, got %d", m.Stats.Connections)
 	}
-	if m.Stats.ActiveAccounts != 2 {
-		t.Fatalf("Did not match active accounts of 2, got %d", m.Stats.ActiveAccounts)
+	if m.Stats.ActiveAccounts != 1 {
+		t.Fatalf("Did not match active accounts of 1, got %d", m.Stats.ActiveAccounts)
 	}
 	if m.Stats.Sent.Msgs < 1 {
 		t.Fatalf("Did not match sent msgs of >=1, got %d", m.Stats.Sent.Msgs)
@@ -1919,8 +1919,8 @@ func TestServerEventsStatsZ(t *testing.T) {
 	if m2.Stats.Connections != 1 {
 		t.Fatalf("Did not match connections of 1, got %d", m2.Stats.Connections)
 	}
-	if m2.Stats.ActiveAccounts != 2 {
-		t.Fatalf("Did not match active accounts of 2, got %d", m2.Stats.ActiveAccounts)
+	if m2.Stats.ActiveAccounts != 1 {
+		t.Fatalf("Did not match active accounts of 1, got %d", m2.Stats.ActiveAccounts)
 	}
 	if m2.Stats.Sent.Msgs < 3 {
 		t.Fatalf("Did not match sent msgs of >= 3, got %d", m2.Stats.Sent.Msgs)
@@ -1946,8 +1946,8 @@ func TestServerEventsStatsZ(t *testing.T) {
 	if m3.Stats.Connections != 1 {
 		t.Fatalf("Did not match connections of 1, got %d", m3.Stats.Connections)
 	}
-	if m3.Stats.ActiveAccounts != 2 {
-		t.Fatalf("Did not match active accounts of 2, got %d", m3.Stats.ActiveAccounts)
+	if m3.Stats.ActiveAccounts != 1 {
+		t.Fatalf("Did not match active accounts of 1, got %d", m3.Stats.ActiveAccounts)
 	}
 	if m3.Stats.Sent.Msgs < 4 {
 		t.Fatalf("Did not match sent msgs of >= 4, got %d", m3.Stats.Sent.Msgs)
@@ -2846,6 +2846,62 @@ func TestServerEventsPingStatsZ(t *testing.T) {
 	}
 }
 
+func TestServerEventsPingStatsZDedicatedRecvQ(t *testing.T) {
+	sa, _, sb, optsB, akp := runTrustedCluster(t)
+	defer sa.Shutdown()
+	defer sb.Shutdown()
+	url := fmt.Sprintf("nats://%s:%d", optsB.Host, optsB.Port)
+	nc, err := nats.Connect(url, createUserCreds(t, sb, akp))
+	require_NoError(t, err)
+	defer nc.Close()
+	// We need to wait a little bit for the $SYS.SERVER.ACCOUNT.%s.CONNS
+	// event to be pushed in the mux'ed queue.
+	time.Sleep(300 * time.Millisecond)
+
+	testReq := func(t *testing.T, subj string, expectTwo bool) {
+		for _, s := range []*Server{sa, sb} {
+			s.mu.RLock()
+			recvq := s.sys.recvq
+			s.mu.RUnlock()
+			recvq.Lock()
+			defer recvq.Unlock()
+		}
+		reply := nc.NewRespInbox()
+		sub := natsSubSync(t, nc, reply)
+		nc.PublishRequest(subj, reply, nil)
+		msg := natsNexMsg(t, sub, time.Second)
+		if len(msg.Data) == 0 {
+			t.Fatal("Unexpected empty response")
+		}
+		// Make sure its a statsz
+		m := ServerStatsMsg{}
+		err := json.Unmarshal(msg.Data, &m)
+		require_NoError(t, err)
+		require_False(t, m.Stats.Start.IsZero())
+		if expectTwo {
+			msg = natsNexMsg(t, sub, time.Second)
+			err = json.Unmarshal(msg.Data, &m)
+			require_NoError(t, err)
+			require_False(t, m.Stats.Start.IsZero())
+		}
+	}
+	const statsz = "STATSZ"
+	for _, test := range []struct {
+		name      string
+		f         func() string
+		expectTwo bool
+	}{
+		{"server stats ping request subject", func() string { return serverStatsPingReqSubj }, true},
+		{"server ping request subject", func() string { return fmt.Sprintf(serverPingReqSubj, statsz) }, true},
+		{"server a direct request subject", func() string { return fmt.Sprintf(serverDirectReqSubj, sa.ID(), statsz) }, false},
+		{"server b direct request subject", func() string { return fmt.Sprintf(serverDirectReqSubj, sb.ID(), statsz) }, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testReq(t, test.f(), test.expectTwo)
+		})
+	}
+}
+
 func TestServerEventsPingStatsZFilter(t *testing.T) {
 	sa, _, sb, optsB, akp := runTrustedCluster(t)
 	defer sa.Shutdown()
@@ -2903,7 +2959,7 @@ func TestServerEventsPingStatsZFailFilter(t *testing.T) {
 	if msg, err := nc.Request(serverStatsPingReqSubj, []byte(`{MALFORMEDJSON`), time.Second/4); err != nil {
 		t.Fatalf("Error: %v", err)
 	} else {
-		resp := make(map[string]map[string]interface{})
+		resp := make(map[string]map[string]any)
 		if err := json.Unmarshal(msg.Data, &resp); err != nil {
 			t.Fatalf("Error unmarshalling the response json: %v", err)
 		}
@@ -2929,8 +2985,8 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 
 	tests := []struct {
 		endpoint  string
-		opt       interface{}
-		resp      interface{}
+		opt       any
+		resp      any
 		respField []string
 	}{
 		{"VARZ", nil, &Varz{},
@@ -2978,11 +3034,11 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 			[]string{"now", "routes"}},
 		{"ROUTEZ", json.RawMessage(`{"name":""}`), &Routez{},
 			[]string{"now", "routes"}},
-		{"ROUTEZ", json.RawMessage(`{"cluster":"TEST CLUSTER 22"}`), &Routez{},
+		{"ROUTEZ", json.RawMessage(`{"cluster":"TEST_CLUSTER_22"}`), &Routez{},
 			[]string{"now", "routes"}},
 		{"ROUTEZ", json.RawMessage(`{"cluster":"CLUSTER"}`), &Routez{},
 			[]string{"now", "routes"}},
-		{"ROUTEZ", json.RawMessage(`{"cluster":"TEST CLUSTER 22", "subscriptions":true}`), &Routez{},
+		{"ROUTEZ", json.RawMessage(`{"cluster":"TEST_CLUSTER_22", "subscriptions":true}`), &Routez{},
 			[]string{"now", "routes"}},
 
 		{"JSZ", nil, &JSzOptions{}, []string{"now", "disabled"}},
@@ -2990,6 +3046,7 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 		{"HEALTHZ", nil, &JSzOptions{}, []string{"status"}},
 		{"HEALTHZ", &HealthzOptions{JSEnabledOnly: true}, &JSzOptions{}, []string{"status"}},
 		{"HEALTHZ", &HealthzOptions{JSServerOnly: true}, &JSzOptions{}, []string{"status"}},
+		{"EXPVARZ", nil, &ExpvarzStatus{}, []string{"memstats", "cmdline"}},
 	}
 
 	for i, test := range tests {
@@ -3017,7 +3074,7 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Error receiving msg: %v", err)
 			}
-			response1 := make(map[string]map[string]interface{})
+			response1 := make(map[string]map[string]any)
 
 			if err := json.Unmarshal(msg.Data, &response1); err != nil {
 				t.Fatalf("Error unmarshalling response1 json: %v", err)
@@ -3046,7 +3103,7 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Error receiving msg: %v", err)
 			}
-			response2 := make(map[string]map[string]interface{})
+			response2 := make(map[string]map[string]any)
 			if err := json.Unmarshal(msg.Data, &response2); err != nil {
 				t.Fatalf("Error unmarshalling the response2 json: %v", err)
 			}
@@ -3058,8 +3115,10 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 					strings.ToLower(test.endpoint), string(msg.Data))
 			} else {
 				for _, respField := range test.respField {
-					if _, ok := resp[respField]; !ok {
+					if val, ok := resp[respField]; !ok {
 						t.Fatalf("Error finding: %s in %s", respField, resp)
+					} else if val == nil {
+						t.Fatalf("Nil value found: %s in %s", respField, resp)
 					}
 				}
 			}
@@ -3080,8 +3139,8 @@ func TestGatewayNameClientInfo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Could not parse INFO json: %v\n", err)
 	}
-	if info.Cluster != "TEST CLUSTER 22" {
-		t.Fatalf("Expected a cluster name of 'TEST CLUSTER 22', got %q", info.Cluster)
+	if info.Cluster != "TEST_CLUSTER_22" {
+		t.Fatalf("Expected a cluster name of 'TEST_CLUSTER_22', got %q", info.Cluster)
 	}
 }
 
@@ -3456,10 +3515,28 @@ func TestServerEventsLDMKick(t *testing.T) {
 	reqkick := KickClientReq{CID: cid}
 	reqkickpayload, _ := json.Marshal(reqkick)
 
-	_, err = ncs.Request(fmt.Sprintf("$SYS.REQ.SERVER.%s.LDM", s.ID()), reqldmpayload, time.Second)
-	if err != nil {
-		t.Fatalf("Error trying to publish the LDM request: %v", err)
+	// Test for data races when getting the client by ID
+	uc := createUserCreds(t, s, akp2)
+	totalClients := 100
+	someClients := make([]*nats.Conn, 0, totalClients)
+	for i := 0; i < totalClients; i++ {
+		nc, err := nats.Connect(s.ClientURL(), uc)
+		require_NoError(t, err)
+		defer nc.Close()
+		someClients = append(someClients, nc)
 	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < totalClients; i++ {
+			someClients[i].Close()
+		}
+	}()
+	defer wg.Wait()
+
+	_, err = ncs.Request(fmt.Sprintf("$SYS.REQ.SERVER.%s.LDM", s.ID()), reqldmpayload, time.Second)
+	require_NoError(t, err)
 
 	select {
 	case <-ldmed:
@@ -3468,9 +3545,7 @@ func TestServerEventsLDMKick(t *testing.T) {
 	}
 
 	_, err = ncs.Request(fmt.Sprintf("$SYS.REQ.SERVER.%s.KICK", s.ID()), reqkickpayload, time.Second)
-	if err != nil {
-		t.Fatalf("Error trying to publish the KICK request: %v", err)
-	}
+	require_NoError(t, err)
 
 	select {
 	case <-disconnected:
@@ -3517,5 +3592,86 @@ func Benchmark_GetHash(b *testing.B) {
 	case err := <-errCh:
 		b.Fatal(err.Error())
 	default:
+	}
+}
+
+func TestClusterSetupMsgs(t *testing.T) {
+	// Tests will set this general faster, but here we want default for production.
+	original := statszRateLimit
+	statszRateLimit = defaultStatszRateLimit
+	defer func() { statszRateLimit = original }()
+
+	numServers := 10
+	c := createClusterEx(t, false, 0, false, "cluster", numServers)
+	defer shutdownCluster(c)
+
+	var totalOut int
+	for _, server := range c.servers {
+		totalOut += int(atomic.LoadInt64(&server.outMsgs))
+	}
+	totalExpected := numServers * numServers
+	if totalOut >= totalExpected {
+		t.Fatalf("Total outMsgs is %d, expected < %d\n", totalOut, totalExpected)
+	}
+}
+
+func TestServerEventsProfileZNotBlockingRecvQ(t *testing.T) {
+	sa, _, sb, optsB, akp := runTrustedCluster(t)
+	defer sa.Shutdown()
+	defer sb.Shutdown()
+	// For this test, we will run a single server because the profiling
+	// would fail for the second server since it would detect that
+	// one profiling is already running (2 servers, but same process).
+	sa.Shutdown()
+	url := fmt.Sprintf("nats://%s:%d", optsB.Host, optsB.Port)
+	nc, err := nats.Connect(url, createUserCreds(t, sb, akp))
+	require_NoError(t, err)
+	defer nc.Close()
+	// We need to wait a little bit for the $SYS.SERVER.ACCOUNT.%s.CONNS
+	// event to be pushed in the mux'ed queue.
+	time.Sleep(300 * time.Millisecond)
+
+	po := ProfilezOptions{Name: "cpu", Duration: 1 * time.Second}
+	req, err := json.Marshal(po)
+	require_NoError(t, err)
+
+	testReq := func(t *testing.T, subj string) {
+		// Block the recvQ by locking it for the duration of this test.
+		sb.mu.RLock()
+		recvq := sb.sys.recvq
+		sb.mu.RUnlock()
+		recvq.Lock()
+		defer recvq.Unlock()
+
+		// Send the profilez request on the given subject.
+		reply := nc.NewRespInbox()
+		sub := natsSubSync(t, nc, reply)
+		nc.PublishRequest(subj, reply, req)
+		msg := natsNexMsg(t, sub, 10*time.Second)
+		if len(msg.Data) == 0 {
+			t.Fatal("Unexpected empty response")
+		}
+		// Make sure its a ServerAPIResponse
+		resp := ServerAPIResponse{Data: &ProfilezStatus{}}
+		err := json.Unmarshal(msg.Data, &resp)
+		require_NoError(t, err)
+		// Check profile status to make sure that we got something.
+		ps := resp.Data.(*ProfilezStatus)
+		if ps.Error != _EMPTY_ {
+			t.Fatalf("%s", ps.Error)
+		}
+		require_True(t, len(ps.Profile) > 0)
+	}
+	const profilez = "PROFILEZ"
+	for _, test := range []struct {
+		name string
+		f    func() string
+	}{
+		{"server profilez request subject", func() string { return fmt.Sprintf(serverPingReqSubj, profilez) }},
+		{"server direct request subject", func() string { return fmt.Sprintf(serverDirectReqSubj, sb.ID(), profilez) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testReq(t, test.f())
+		})
 	}
 }

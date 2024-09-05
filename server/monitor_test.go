@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
@@ -55,6 +56,47 @@ func DefaultMonitorOptions() *Options {
 		NoSigs:       true,
 		Tags:         []string{"tag"},
 	}
+}
+
+func runMonitorJSServer(t *testing.T, clientPort int, monitorPort int, clusterPort int, routePort int) (*Server, *Options) {
+	resetPreviousHTTPConnections()
+	tmpDir := t.TempDir()
+	cf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:%d
+		http: 127.0.0.1:%d
+		system_account: SYS
+		accounts {
+			SYS {
+				users [{user: sys, password: pwd}]
+			}
+			ACC {
+				users [{user: usr, password: pwd}]
+				// In clustered mode, these reservations will not impact any one server.
+				jetstream: {max_store: 4Mb, max_memory: 5Mb}
+			}
+			BCC_TO_HAVE_ONE_EXTRA {
+				users [{user: usr2, password: pwd}]
+				jetstream: enabled
+			}
+		}
+		jetstream: {
+			max_mem_store: 10Mb
+			max_file_store: 10Mb
+			store_dir: '%s'
+			unique_tag: az
+			limits: {
+				max_ha_assets: 1000
+			}
+		}
+		cluster {
+			name: cluster_name
+			listen: 127.0.0.1:%d
+			routes: [nats-route://127.0.0.1:%d]
+		}
+		server_name: server_%d
+		server_tags: [ "az:%d", "tag" ] `, clientPort, monitorPort, tmpDir, clusterPort, routePort, clientPort, clientPort)))
+
+	return RunServerWithConfig(cf)
 }
 
 func runMonitorServer() *Server {
@@ -229,7 +271,7 @@ func TestVarzSubscriptionsResetProperly(t *testing.T) {
 }
 
 func TestHandleVarz(t *testing.T) {
-	s := runMonitorServer()
+	s, _ := runMonitorJSServer(t, -1, -1, 0, 0)
 	defer s.Shutdown()
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
@@ -245,7 +287,7 @@ func TestHandleVarz(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	nc := createClientConnSubscribeAndPublish(t, s)
+	nc := createClientConnWithUserSubscribeAndPublish(t, s, "sys", "pwd")
 	defer nc.Close()
 
 	for mode := 0; mode < 2; mode++ {
@@ -269,14 +311,33 @@ func TestHandleVarz(t *testing.T) {
 		if v.OutBytes != 5 {
 			t.Fatalf("Expected OutBytes of 5, got %v\n", v.OutBytes)
 		}
-		if v.Subscriptions != 0 {
-			t.Fatalf("Expected Subscriptions of 0, got %v\n", v.Subscriptions)
+		if v.Subscriptions <= 10 {
+			t.Fatalf("Expected Subscriptions of at least 10, got %v\n", v.Subscriptions)
 		}
-		if v.Name != "monitor_server" {
-			t.Fatal("Expected ServerName to be 'monitor_server'")
+		if v.Name != "server_-1" {
+			t.Fatalf("Expected ServerName to be 'monitor_server' got %q", v.Name)
 		}
 		if !v.Tags.Contains("tag") {
-			t.Fatal("Expected tags to be 'tag'")
+			t.Fatalf("Expected tags to be 'tag' got %v", v.Tags)
+		}
+		if v.JetStream.Config == nil {
+			t.Fatalf("JS Config not set")
+		}
+		sd := filepath.Join(s.opts.StoreDir, "jetstream")
+		if v.JetStream.Config.StoreDir != sd {
+			t.Fatalf("JS Config is invalid expected %q got %q", sd, v.JetStream.Config.StoreDir)
+		}
+		if v.JetStream.Stats == nil {
+			t.Fatalf("JS Stats not set")
+		}
+		if v.JetStream.Stats.Accounts != 2 {
+			t.Fatalf("Invalid stats expected 2 accounts got %d", v.JetStream.Stats.Accounts)
+		}
+		if v.JetStream.Limits == nil {
+			t.Fatalf("JS limits not set")
+		}
+		if v.JetStream.Limits.MaxHAAssets != 1000 {
+			t.Fatalf("Expected 1000 max_ha_assets got %q", v.JetStream.Limits.MaxHAAssets)
 		}
 	}
 
@@ -544,7 +605,7 @@ func TestConnzWithCID(t *testing.T) {
 }
 
 // Helper to map to connection name
-func createConnMap(t *testing.T, cz *Connz) map[string]*ConnInfo {
+func createConnMap(cz *Connz) map[string]*ConnInfo {
 	cm := make(map[string]*ConnInfo)
 	for _, c := range cz.Conns {
 		cm[c.Name] = c
@@ -552,7 +613,7 @@ func createConnMap(t *testing.T, cz *Connz) map[string]*ConnInfo {
 	return cm
 }
 
-func getFooAndBar(t *testing.T, cm map[string]*ConnInfo) (*ConnInfo, *ConnInfo) {
+func getFooAndBar(cm map[string]*ConnInfo) (*ConnInfo, *ConnInfo) {
 	return cm["foo"], cm["bar"]
 }
 
@@ -640,7 +701,7 @@ func TestConnzLastActivity(t *testing.T) {
 		defer ncBar.Close()
 
 		// Test inside details of each connection
-		ciFoo, ciBar := getFooAndBar(t, createConnMap(t, pollConz(t, s, mode, url, opts)))
+		ciFoo, ciBar := getFooAndBar(createConnMap(pollConz(t, s, mode, url, opts)))
 
 		// Test that LastActivity is non-zero
 		if ciFoo.LastActivity.IsZero() {
@@ -666,7 +727,7 @@ func TestConnzLastActivity(t *testing.T) {
 		sub, _ := ncFoo.Subscribe("hello.world", func(m *nats.Msg) {})
 		ensureServerActivityRecorded(t, ncFoo)
 
-		ciFoo, _ = getFooAndBar(t, createConnMap(t, pollConz(t, s, mode, url, opts)))
+		ciFoo, _ = getFooAndBar(createConnMap(pollConz(t, s, mode, url, opts)))
 		nextLA := ciFoo.LastActivity
 		if fooLA.Equal(nextLA) {
 			t.Fatalf("Subscribe should have triggered update to LastActivity %+v\n", ciFoo)
@@ -682,7 +743,7 @@ func TestConnzLastActivity(t *testing.T) {
 		ensureServerActivityRecorded(t, ncFoo)
 		ensureServerActivityRecorded(t, ncBar)
 
-		ciFoo, ciBar = getFooAndBar(t, createConnMap(t, pollConz(t, s, mode, url, opts)))
+		ciFoo, ciBar = getFooAndBar(createConnMap(pollConz(t, s, mode, url, opts)))
 		nextLA = ciBar.LastActivity
 		if barLA.Equal(nextLA) {
 			t.Fatalf("Publish should have triggered update to LastActivity\n")
@@ -701,7 +762,7 @@ func TestConnzLastActivity(t *testing.T) {
 		sub.Unsubscribe()
 		ensureServerActivityRecorded(t, ncFoo)
 
-		ciFoo, _ = getFooAndBar(t, createConnMap(t, pollConz(t, s, mode, url, opts)))
+		ciFoo, _ = getFooAndBar(createConnMap(pollConz(t, s, mode, url, opts)))
 		nextLA = ciFoo.LastActivity
 		if fooLA.Equal(nextLA) {
 			t.Fatalf("Message delivery should have triggered update to LastActivity\n")
@@ -2391,7 +2452,7 @@ func TestClusterEmptyWhenNotDefined(t *testing.T) {
 	defer s.Shutdown()
 
 	body := readBody(t, fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port))
-	var v map[string]interface{}
+	var v map[string]any
 	if err := json.Unmarshal(body, &v); err != nil {
 		t.Fatalf("Got an error unmarshalling the body: %v\n", err)
 	}
@@ -2400,7 +2461,7 @@ func TestClusterEmptyWhenNotDefined(t *testing.T) {
 	if !ok {
 		return
 	}
-	if len(c.(map[string]interface{})) != 0 {
+	if len(c.(map[string]any)) != 0 {
 		t.Fatalf("Expected an empty cluster definition, instead got %+v\n", c)
 	}
 }
@@ -4044,13 +4105,84 @@ func TestMonitorAccountz(t *testing.T) {
 	body = string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s?acc=$SYS", s.MonitorAddr().Port, AccountzPath)))
 	require_Contains(t, body, `"account_detail": {`)
 	require_Contains(t, body, `"account_name": "$SYS",`)
-	require_Contains(t, body, `"subscriptions": 50,`)
+	require_Contains(t, body, `"subscriptions": 52,`)
 	require_Contains(t, body, `"is_system": true,`)
 	require_Contains(t, body, `"system_account": "$SYS"`)
 
 	body = string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s?unused=1", s.MonitorAddr().Port, AccountStatzPath)))
 	require_Contains(t, body, `"acc": "$G"`)
+	require_Contains(t, body, `"name": "$G"`)
 	require_Contains(t, body, `"acc": "$SYS"`)
+	require_Contains(t, body, `"name": "$SYS"`)
+	require_Contains(t, body, `"sent": {`)
+	require_Contains(t, body, `"received": {`)
+	require_Contains(t, body, `"total_conns": 0,`)
+	require_Contains(t, body, `"leafnodes": 0,`)
+}
+
+func TestMonitorAccountzOperatorMode(t *testing.T) {
+	_, sysPub := createKey(t)
+	sysClaim := jwt.NewAccountClaims(sysPub)
+	sysClaim.Name = "SYS"
+	sysJwt := encodeClaim(t, sysClaim, sysPub)
+
+	accKp, accPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(accPub)
+	accClaim.Name = "APP"
+	accJwt := encodeClaim(t, accClaim, accPub)
+
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		http: 127.0.0.1:-1
+		operator = %s
+		resolver = MEMORY
+		system_account: %s
+		resolver_preload = {
+			%s : %s
+			%s : %s
+		}
+	`, ojwt, sysPub, accPub, accJwt, sysPub, sysJwt)))
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	createUser := func() (string, string) {
+		ukp, _ := nkeys.CreateUser()
+		seed, _ := ukp.Seed()
+		upub, _ := ukp.PublicKey()
+		uclaim := newJWTTestUserClaims()
+		uclaim.Subject = upub
+		ujwt, err := uclaim.Encode(accKp)
+		require_NoError(t, err)
+		return upub, genCredsFile(t, ujwt, seed)
+	}
+
+	_, aCreds := createUser()
+
+	nc, err := nats.Connect(s.ClientURL(), nats.UserCredentials(aCreds))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	body := string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s", s.MonitorAddr().Port, AccountzPath)))
+	require_Contains(t, body, accPub)
+	require_Contains(t, body, sysPub)
+	require_Contains(t, body, `"accounts": [`)
+	require_Contains(t, body, fmt.Sprintf(`"system_account": "%s"`, sysPub))
+
+	body = string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s?acc=%s", s.MonitorAddr().Port, AccountzPath, sysPub)))
+	require_Contains(t, body, `"account_detail": {`)
+	require_Contains(t, body, fmt.Sprintf(`"account_name": "%s",`, sysPub))
+	require_Contains(t, body, `"subscriptions": 52,`)
+	require_Contains(t, body, `"is_system": true,`)
+	require_Contains(t, body, fmt.Sprintf(`"system_account": "%s"`, sysPub))
+
+	// TODO: understand why the APP account did not show up in the accountz detail
+	// even though unused is set. It required a connection to be made to show up.
+	body = string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s?unused=1", s.MonitorAddr().Port, AccountStatzPath)))
+	require_Contains(t, body, fmt.Sprintf(`"acc": "%s"`, accPub))
+	require_Contains(t, body, fmt.Sprintf(`"name": "%s"`, accClaim.Name))
+	require_Contains(t, body, fmt.Sprintf(`"acc": "%s"`, sysPub))
+	require_Contains(t, body, fmt.Sprintf(`"name": "%s"`, sysClaim.Name))
 	require_Contains(t, body, `"sent": {`)
 	require_Contains(t, body, `"received": {`)
 	require_Contains(t, body, `"total_conns": 0,`)
@@ -4203,40 +4335,7 @@ func TestMonitorJsz(t *testing.T) {
 		{7500, 7501, 7502, 5502},
 		{5500, 5501, 5502, 7502},
 	} {
-		tmpDir := t.TempDir()
-		cf := createConfFile(t, []byte(fmt.Sprintf(`
-		listen: 127.0.0.1:%d
-		http: 127.0.0.1:%d
-		system_account: SYS
-		accounts {
-			SYS {
-				users [{user: sys, password: pwd}]
-			}
-			ACC {
-				users [{user: usr, password: pwd}]
-				// In clustered mode, these reservations will not impact any one server.
-				jetstream: {max_store: 4Mb, max_memory: 5Mb}
-			}
-			BCC_TO_HAVE_ONE_EXTRA {
-				users [{user: usr2, password: pwd}]
-				jetstream: enabled
-			}
-		}
-		jetstream: {
-			max_mem_store: 10Mb
-			max_file_store: 10Mb
-			store_dir: '%s'
-			unique_tag: az
-		}
-		cluster {
-			name: cluster_name
-			listen: 127.0.0.1:%d
-			routes: [nats-route://127.0.0.1:%d]
-		}
-		server_name: server_%d
-		server_tags: [ "az:%d" ] `, test.port, test.mport, tmpDir, test.cport, test.routed, test.port, test.port)))
-
-		s, _ := RunServerWithConfig(cf)
+		s, _ := runMonitorJSServer(t, test.port, test.mport, test.cport, test.routed)
 		defer s.Shutdown()
 		srvs = append(srvs, s)
 	}
@@ -4305,6 +4404,9 @@ func TestMonitorJsz(t *testing.T) {
 			}
 			if info.Messages != 2 {
 				t.Fatalf("expected two message but got %d", info.Messages)
+			}
+			if info.Limits.MaxHAAssets != 1000 {
+				t.Fatalf("expected max_ha_assets limit to be 1000 got %v", info.Limits)
 			}
 		}
 	})
@@ -4414,6 +4516,25 @@ func TestMonitorJsz(t *testing.T) {
 			}
 		}
 	})
+	t.Run("stream-leader-only", func(t *testing.T) {
+		// First server
+		info := readJsInfo(monUrl1 + "?streams=true&stream-leader-only=1")
+		for _, a := range info.AccountDetails {
+			for _, s := range a.Streams {
+				if s.Cluster.Leader != srvs[0].serverName() {
+					t.Fatalf("expected stream leader to be %s but got %s", srvs[0].serverName(), s.Cluster.Leader)
+				}
+			}
+		}
+		info = readJsInfo(monUrl2 + "?streams=true&stream-leader-only=1")
+		for _, a := range info.AccountDetails {
+			for _, s := range a.Streams {
+				if s.Cluster.Leader != srvs[1].serverName() {
+					t.Fatalf("expected stream leader to be %s but got %s", srvs[0].serverName(), s.Cluster.Leader)
+				}
+			}
+		}
+	})
 	t.Run("consumers", func(t *testing.T) {
 		for _, url := range []string{monUrl1, monUrl2} {
 			info := readJsInfo(url + "?acc=ACC&consumers=true")
@@ -4501,7 +4622,15 @@ func TestMonitorJsz(t *testing.T) {
 	})
 	t.Run("account-non-existing", func(t *testing.T) {
 		for _, url := range []string{monUrl1, monUrl2} {
-			info := readJsInfo(url + "?acc=DOES_NOT_EXIT")
+			info := readJsInfo(url + "?acc=DOES_NOT_EXIST")
+			if len(info.AccountDetails) != 0 {
+				t.Fatalf("expected no account to be returned by %s but got %v", url, info)
+			}
+		}
+	})
+	t.Run("account-non-existing-with-stream-details", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=DOES_NOT_EXIST&streams=true")
 			if len(info.AccountDetails) != 0 {
 				t.Fatalf("expected no account to be returned by %s but got %v", url, info)
 			}
@@ -5223,11 +5352,39 @@ func TestHealthzStatusUnavailable(t *testing.T) {
 		t.Fatalf("got an error disabling JetStream: %v", err)
 	}
 
-	checkHealthzEndpoint(t, s.MonitorAddr().String(), http.StatusServiceUnavailable, "unavailable")
+	for _, test := range []struct {
+		name       string
+		url        string
+		statusCode int
+		wantStatus string
+	}{
+		{
+			"healthz",
+			fmt.Sprintf("http://%s/healthz", s.MonitorAddr().String()),
+			http.StatusServiceUnavailable,
+			"unavailable",
+		},
+		{
+			"js-enabled-only",
+			fmt.Sprintf("http://%s/healthz?js-enabled-only=true", s.MonitorAddr().String()),
+			http.StatusServiceUnavailable,
+			"unavailable",
+		},
+		{
+			"js-server-only",
+			fmt.Sprintf("http://%s/healthz?js-server-only=true", s.MonitorAddr().String()),
+			http.StatusOK,
+			"ok",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			expectHealthStatus(t, test.url, test.statusCode, test.wantStatus)
+		})
+	}
 }
 
 // When we converted ipq to use generics we still were using sync.Map. Currently you can not convert
-// interface{} or any to a generic parameterized type. So this stopped working and panics.
+// any or any to a generic parameterized type. So this stopped working and panics.
 func TestIpqzWithGenerics(t *testing.T) {
 	opts := DefaultMonitorOptions()
 	opts.JetStream = true

@@ -1,4 +1,4 @@
-// Copyright 2012-2020 The NATS Authors
+// Copyright 2012-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -28,13 +28,14 @@ import (
 	"os"
 	"reflect"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	srvlog "github.com/nats-io/nats-server/v2/logger"
 	"github.com/nats-io/nats.go"
 )
 
@@ -86,6 +87,13 @@ func RunServer(opts *Options) *Server {
 		s.ConfigureLogger()
 	}
 
+	if ll := os.Getenv("NATS_LOGGING"); ll != "" {
+		log := srvlog.NewTestLogger(fmt.Sprintf("[%s] | ", s), true)
+		debug := ll == "debug" || ll == "trace"
+		trace := ll == "trace"
+		s.SetLoggerV2(log, debug, trace, false)
+	}
+
 	// Run server in Go routine.
 	s.Start()
 
@@ -113,6 +121,12 @@ func RunServerWithConfig(configFile string) (srv *Server, opts *Options) {
 	return
 }
 
+func TestSemanticVersion(t *testing.T) {
+	if !semVerRe.MatchString(VERSION) {
+		t.Fatalf("Version (%s) is not a valid SemVer string", VERSION)
+	}
+}
+
 func TestVersionMatchesTag(t *testing.T) {
 	tag := os.Getenv("TRAVIS_TAG")
 	// Travis started to return '' when no tag is set. Support both now.
@@ -128,6 +142,17 @@ func TestVersionMatchesTag(t *testing.T) {
 	// Strip the `v` from the tag for the version comparison.
 	if VERSION != tag[1:] {
 		t.Fatalf("Version (%s) does not match tag (%s)", VERSION, tag[1:])
+	}
+	// Check that the version dynamically set via ldflags matches the version
+	// from the server previous to releasing.
+	if serverVersion == _EMPTY_ {
+		t.Fatal("Version missing in ldflags")
+	}
+	// Unlike VERSION constant, serverVersion is prefixed with a 'v'
+	// since it should be the same as the git tag.
+	expected := "v" + VERSION
+	if serverVersion != _EMPTY_ && expected != serverVersion {
+		t.Fatalf("Version (%s) does not match ldflags version (%s)", expected, serverVersion)
 	}
 }
 
@@ -736,7 +761,7 @@ func TestProfilingNoTimeout(t *testing.T) {
 	if srv == nil {
 		t.Fatalf("Profiling server not set")
 	}
-	if srv.ReadTimeout != 0 {
+	if srv.ReadTimeout != time.Second*5 {
 		t.Fatalf("ReadTimeout should not be set, was set to %v", srv.ReadTimeout)
 	}
 	if srv.WriteTimeout != 0 {
@@ -1035,9 +1060,9 @@ func TestLameDuckModeInfo(t *testing.T) {
 		t.Helper()
 		var si *serverInfo
 		for i, ws := range []bool{false, true} {
-			sort.Strings(expected[i])
+			slices.Sort(expected[i])
 			si = getInfo(ws)
-			sort.Strings(si.ConnectURLs)
+			slices.Sort(si.ConnectURLs)
 			if !reflect.DeepEqual(expected[i], si.ConnectURLs) {
 				t.Fatalf("Expected %q, got %q", expected, si.ConnectURLs)
 			}
@@ -1986,16 +2011,20 @@ func TestServerRateLimitLogging(t *testing.T) {
 
 	s.RateLimitWarnf("Warning number 1")
 	s.RateLimitWarnf("Warning number 2")
+	s.rateLimitFormatWarnf("warning value %d", 1)
 	s.RateLimitWarnf("Warning number 1")
 	s.RateLimitWarnf("Warning number 2")
+	s.rateLimitFormatWarnf("warning value %d", 2)
 
 	checkLog := func(c1, c2 *client) {
 		t.Helper()
 
 		nb1 := "Warning number 1"
 		nb2 := "Warning number 2"
+		nbv := "warning value"
 		gotOne := 0
 		gotTwo := 0
+		gotFormat := 0
 		for done := false; !done; {
 			select {
 			case w := <-l.warn:
@@ -2003,6 +2032,8 @@ func TestServerRateLimitLogging(t *testing.T) {
 					gotOne++
 				} else if strings.Contains(w, nb2) {
 					gotTwo++
+				} else if strings.Contains(w, nbv) {
+					gotFormat++
 				}
 			case <-time.After(150 * time.Millisecond):
 				done = true
@@ -2014,27 +2045,39 @@ func TestServerRateLimitLogging(t *testing.T) {
 		if gotTwo != 1 {
 			t.Fatalf("Should have had only 1 warning for nb2, got %v", gotTwo)
 		}
+		if gotFormat != 1 {
+			t.Fatalf("Should have had only 1 warning for format, got %v", gotFormat)
+		}
 
 		// Wait for more than the expiration interval
 		time.Sleep(200 * time.Millisecond)
 		if c1 == nil {
-			s.RateLimitWarnf(nb1)
+			s.RateLimitWarnf("%s", nb1)
+			s.rateLimitFormatWarnf("warning value %d", 1)
 		} else {
-			c1.RateLimitWarnf(nb1)
-			c2.RateLimitWarnf(nb1)
+			c1.RateLimitWarnf("%s", nb1)
+			c2.RateLimitWarnf("%s", nb1)
+			c1.rateLimitFormatWarnf("warning value %d", 1)
 		}
 		gotOne = 0
+		gotFormat = 0
 		for {
 			select {
 			case w := <-l.warn:
 				if strings.Contains(w, nb1) {
 					gotOne++
+				} else if strings.Contains(w, nbv) {
+					gotFormat++
 				}
 			case <-time.After(200 * time.Millisecond):
 				if gotOne == 0 {
 					t.Fatalf("Warning was still suppressed")
 				} else if gotOne > 1 {
 					t.Fatalf("Should have had only 1 warning for nb1, got %v", gotOne)
+				} else if gotFormat == 0 {
+					t.Fatalf("Warning was still suppressed")
+				} else if gotFormat > 1 {
+					t.Fatalf("Should have had only 1 warning for format, got %v", gotFormat)
 				} else {
 					// OK! we are done
 					return
@@ -2076,8 +2119,10 @@ func TestServerRateLimitLogging(t *testing.T) {
 
 	c1.RateLimitWarnf("Warning number 1")
 	c1.RateLimitWarnf("Warning number 2")
+	c1.rateLimitFormatWarnf("warning value %d", 1)
 	c2.RateLimitWarnf("Warning number 1")
 	c2.RateLimitWarnf("Warning number 2")
+	c2.rateLimitFormatWarnf("warning value %d", 2)
 
 	checkLog(c1, c2)
 }
@@ -2106,4 +2151,87 @@ func TestServerAuthBlockAndSysAccounts(t *testing.T) {
 	// This should not.
 	_, err = nats.Connect(s.ClientURL())
 	require_Error(t, err, nats.ErrAuthorization, errors.New("nats: Authorization Violation"))
+}
+
+// https://github.com/nats-io/nats-server/issues/5396
+func TestServerConfigLastLineComments(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+	{
+		"listen":  "0.0.0.0:4222"
+	}
+	# wibble
+	`))
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// This should work of course.
+	nc, err := nats.Connect(s.ClientURL())
+	require_NoError(t, err)
+	defer nc.Close()
+}
+
+func TestServerClusterAndGatewayNameNoSpace(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		port: -1
+		server_name: "my server"
+	`))
+	_, err := ProcessConfigFile(conf)
+	require_Error(t, err, ErrServerNameHasSpaces)
+
+	o := DefaultOptions()
+	o.ServerName = "my server"
+	_, err = NewServer(o)
+	require_Error(t, err, ErrServerNameHasSpaces)
+
+	conf = createConfFile(t, []byte(`
+		port: -1
+		server_name: "myserver"
+		cluster {
+			port: -1
+			name: "my cluster"
+		}
+	`))
+	_, err = ProcessConfigFile(conf)
+	require_Error(t, err, ErrClusterNameHasSpaces)
+
+	o = DefaultOptions()
+	o.Cluster.Name = "my cluster"
+	o.Cluster.Port = -1
+	_, err = NewServer(o)
+	require_Error(t, err, ErrClusterNameHasSpaces)
+
+	conf = createConfFile(t, []byte(`
+		port: -1
+		server_name: "myserver"
+		gateway {
+			port: -1
+			name: "my gateway"
+		}
+	`))
+	_, err = ProcessConfigFile(conf)
+	require_Error(t, err, ErrGatewayNameHasSpaces)
+
+	o = DefaultOptions()
+	o.Cluster.Name = _EMPTY_
+	o.Cluster.Port = 0
+	o.Gateway.Name = "my gateway"
+	o.Gateway.Port = -1
+	_, err = NewServer(o)
+	require_Error(t, err, ErrGatewayNameHasSpaces)
+}
+
+func TestServerClientURL(t *testing.T) {
+	for host, expected := range map[string]string{
+		"host.com": "nats://host.com:12345",
+		"1.2.3.4":  "nats://1.2.3.4:12345",
+		"2000::1":  "nats://[2000::1]:12345",
+	} {
+		o := DefaultOptions()
+		o.Host = host
+		o.Port = 12345
+		s, err := NewServer(o)
+		require_NoError(t, err)
+		require_Equal(t, s.ClientURL(), expected)
+	}
 }
