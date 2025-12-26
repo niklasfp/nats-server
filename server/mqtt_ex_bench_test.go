@@ -1,4 +1,4 @@
-// Copyright 2024 The NATS Authors
+// Copyright 2024-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -12,7 +12,6 @@
 // limitations under the License.
 
 //go:build !skip_mqtt_tests
-// +build !skip_mqtt_tests
 
 package server
 
@@ -188,8 +187,6 @@ func (bc mqttBenchContext) runAndReport(b *testing.B, name string, extraArgs ...
 func (bc *mqttBenchContext) startServer(b *testing.B, disableRMSCache bool) func() {
 	b.Helper()
 	b.StopTimer()
-	prevDisableRMSCache := testDisableRMSCache
-	testDisableRMSCache = disableRMSCache
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(b, o)
 
@@ -199,15 +196,12 @@ func (bc *mqttBenchContext) startServer(b *testing.B, disableRMSCache bool) func
 	mqttInitTestServer(b, mqttNewDial("", "", bc.Host, bc.Port, ""))
 	return func() {
 		testMQTTShutdownServer(s)
-		testDisableRMSCache = prevDisableRMSCache
 	}
 }
 
 func (bc *mqttBenchContext) startCluster(b *testing.B, disableRMSCache bool) func() {
 	b.Helper()
 	b.StopTimer()
-	prevDisableRMSCache := testDisableRMSCache
-	testDisableRMSCache = disableRMSCache
 	conf := `
 		listen: 127.0.0.1:-1
 		server_name: %s
@@ -235,7 +229,6 @@ func (bc *mqttBenchContext) startCluster(b *testing.B, disableRMSCache bool) fun
 	mqttInitTestServer(b, mqttNewDial("", "", bc.Host, bc.Port, ""))
 	return func() {
 		cl.shutdown()
-		testDisableRMSCache = prevDisableRMSCache
 	}
 }
 

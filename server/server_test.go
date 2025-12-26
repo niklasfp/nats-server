@@ -1,4 +1,4 @@
-// Copyright 2012-2024 The NATS Authors
+// Copyright 2012-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -35,8 +35,10 @@ import (
 	"testing"
 	"time"
 
-	srvlog "github.com/nats-io/nats-server/v2/logger"
 	"github.com/nats-io/nats.go"
+
+	"github.com/nats-io/nats-server/v2/internal/antithesis"
+	srvlog "github.com/nats-io/nats-server/v2/logger"
 )
 
 func checkForErr(totalWait, sleepDur time.Duration, f func() error) error {
@@ -56,6 +58,7 @@ func checkFor(t testing.TB, totalWait, sleepDur time.Duration, f func() error) {
 	t.Helper()
 	err := checkForErr(totalWait, sleepDur, f)
 	if err != nil {
+		antithesis.AssertUnreachable(t, "Timeout in checkFor", nil)
 		t.Fatal(err.Error())
 	}
 }
@@ -217,64 +220,124 @@ func TestTLSVersions(t *testing.T) {
 	}
 }
 
-func TestTlsCipher(t *testing.T) {
-	if strings.Compare(tlsCipher(0x0005), "TLS_RSA_WITH_RC4_128_SHA") != 0 {
-		t.Fatalf("Invalid tls cipher")
+func TestTLSMinVersionConfig(t *testing.T) {
+	tmpl := `
+		listen: "127.0.0.1:-1"
+		tls {
+			cert_file: 	"../test/configs/certs/server-cert.pem"
+			key_file:  	"../test/configs/certs/server-key.pem"
+			timeout: 	1
+			min_version: 	%s
+		}
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, `"1.3"`)))
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	connect := func(t *testing.T, tlsConf *tls.Config, expectedErr error) {
+		t.Helper()
+		opts := []nats.Option{}
+		if tlsConf != nil {
+			opts = append(opts, nats.Secure(tlsConf))
+		}
+		opts = append(opts, nats.RootCAs("../test/configs/certs/ca.pem"))
+		nc, err := nats.Connect(fmt.Sprintf("tls://localhost:%d", o.Port), opts...)
+		if err == nil {
+			defer nc.Close()
+		}
+		if expectedErr == nil {
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		} else if err == nil || err.Error() != expectedErr.Error() {
+			nc.Close()
+			t.Fatalf("Expected error %v, got: %v", expectedErr, err)
+		}
 	}
-	if strings.Compare(tlsCipher(0x000a), "TLS_RSA_WITH_3DES_EDE_CBC_SHA") != 0 {
-		t.Fatalf("Invalid tls cipher")
+
+	// Cannot connect with client requiring a lower minimum TLS Version.
+	connect(t, &tls.Config{
+		MaxVersion: tls.VersionTLS12,
+	}, errors.New(`remote error: tls: protocol version not supported`))
+
+	// Should connect since matching minimum TLS version.
+	connect(t, &tls.Config{
+		MinVersion: tls.VersionTLS13,
+	}, nil)
+
+	// Reloading with invalid values should fail.
+	if err := os.WriteFile(conf, []byte(fmt.Sprintf(tmpl, `"1.0"`)), 0666); err != nil {
+		t.Fatalf("Error creating config file: %v", err)
 	}
-	if strings.Compare(tlsCipher(0x002f), "TLS_RSA_WITH_AES_128_CBC_SHA") != 0 {
-		t.Fatalf("Invalid tls cipher")
+	if err := s.Reload(); err == nil {
+		t.Fatalf("Expected reload to fail: %v", err)
 	}
-	if strings.Compare(tlsCipher(0x0035), "TLS_RSA_WITH_AES_256_CBC_SHA") != 0 {
-		t.Fatalf("Invalid tls cipher")
+
+	// Reloading with original values and no changes should be ok.
+	if err := os.WriteFile(conf, []byte(fmt.Sprintf(tmpl, `"1.3"`)), 0666); err != nil {
+		t.Fatalf("Error creating config file: %v", err)
 	}
-	if strings.Compare(tlsCipher(0xc007), "TLS_ECDHE_ECDSA_WITH_RC4_128_SHA") != 0 {
-		t.Fatalf("Invalid tls cipher")
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Unexpected error reloading TLS version: %v", err)
 	}
-	if strings.Compare(tlsCipher(0xc009), "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA") != 0 {
-		t.Fatalf("Invalid tls cipher")
+
+	// Reloading with a new minimum lower version.
+	if err := os.WriteFile(conf, []byte(fmt.Sprintf(tmpl, `"1.2"`)), 0666); err != nil {
+		t.Fatalf("Error creating config file: %v", err)
 	}
-	if strings.Compare(tlsCipher(0xc00a), "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA") != 0 {
-		t.Fatalf("Invalid tls cipher")
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Unexpected error reloading: %v", err)
 	}
-	if strings.Compare(tlsCipher(0xc011), "TLS_ECDHE_RSA_WITH_RC4_128_SHA") != 0 {
-		t.Fatalf("Invalid tls cipher")
+
+	// Should connect since now matching minimum TLS version.
+	connect(t, &tls.Config{
+		MaxVersion: tls.VersionTLS12,
+	}, nil)
+	connect(t, &tls.Config{
+		MinVersion: tls.VersionTLS13,
+	}, nil)
+
+	// Setting unsupported TLS versions
+	if err := os.WriteFile(conf, []byte(fmt.Sprintf(tmpl, `"1.4"`)), 0666); err != nil {
+		t.Fatalf("Error creating config file: %v", err)
 	}
-	if strings.Compare(tlsCipher(0xc012), "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA") != 0 {
-		t.Fatalf("Invalid tls cipher")
+	if err := s.Reload(); err == nil || !strings.Contains(err.Error(), `unknown version: 1.4`) {
+		t.Fatalf("Unexpected error reloading: %v", err)
 	}
-	if strings.Compare(tlsCipher(0xc013), "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA") != 0 {
-		t.Fatalf("Invalid tls cipher")
+
+	tc := &TLSConfigOpts{
+		CertFile:   "../test/configs/certs/server-cert.pem",
+		KeyFile:    "../test/configs/certs/server-key.pem",
+		CaFile:     "../test/configs/certs/ca.pem",
+		Timeout:    4.0,
+		MinVersion: tls.VersionTLS11,
 	}
-	if strings.Compare(tlsCipher(0xc014), "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA") != 0 {
-		t.Fatalf("IUnknownnvalid tls cipher")
+	_, err := GenTLSConfig(tc)
+	if err == nil || err.Error() != `unsupported minimum TLS version: TLS 1.1` {
+		t.Fatalf("Expected error generating TLS config: %v", err)
 	}
-	if strings.Compare(tlsCipher(0xc02f), "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256") != 0 {
-		t.Fatalf("Invalid tls cipher")
-	}
-	if strings.Compare(tlsCipher(0xc02b), "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256") != 0 {
-		t.Fatalf("Invalid tls cipher")
-	}
-	if strings.Compare(tlsCipher(0xc030), "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384") != 0 {
-		t.Fatalf("Invalid tls cipher")
-	}
-	if strings.Compare(tlsCipher(0xc02c), "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384") != 0 {
-		t.Fatalf("Invalid tls cipher")
-	}
-	if strings.Compare(tlsCipher(0x1301), "TLS_AES_128_GCM_SHA256") != 0 {
-		t.Fatalf("Invalid tls cipher")
-	}
-	if strings.Compare(tlsCipher(0x1302), "TLS_AES_256_GCM_SHA384") != 0 {
-		t.Fatalf("Invalid tls cipher")
-	}
-	if strings.Compare(tlsCipher(0x1303), "TLS_CHACHA20_POLY1305_SHA256") != 0 {
-		t.Fatalf("Invalid tls cipher")
-	}
-	if strings.Compare(tlsCipher(0x9999), "Unknown [0x9999]") != 0 {
-		t.Fatalf("Expected an unknown cipher")
-	}
+}
+
+func TestTLSCipher(t *testing.T) {
+	require_Equal(t, tls.CipherSuiteName(0x0005), "TLS_RSA_WITH_RC4_128_SHA")
+	require_Equal(t, tls.CipherSuiteName(0x000a), "TLS_RSA_WITH_3DES_EDE_CBC_SHA")
+	require_Equal(t, tls.CipherSuiteName(0x002f), "TLS_RSA_WITH_AES_128_CBC_SHA")
+	require_Equal(t, tls.CipherSuiteName(0x0035), "TLS_RSA_WITH_AES_256_CBC_SHA")
+	require_Equal(t, tls.CipherSuiteName(0xc007), "TLS_ECDHE_ECDSA_WITH_RC4_128_SHA")
+	require_Equal(t, tls.CipherSuiteName(0xc009), "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA")
+	require_Equal(t, tls.CipherSuiteName(0xc00a), "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA")
+	require_Equal(t, tls.CipherSuiteName(0xc011), "TLS_ECDHE_RSA_WITH_RC4_128_SHA")
+	require_Equal(t, tls.CipherSuiteName(0xc012), "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA")
+	require_Equal(t, tls.CipherSuiteName(0xc013), "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA")
+	require_Equal(t, tls.CipherSuiteName(0xc014), "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA")
+	require_Equal(t, tls.CipherSuiteName(0xc02f), "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
+	require_Equal(t, tls.CipherSuiteName(0xc02b), "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256")
+	require_Equal(t, tls.CipherSuiteName(0xc030), "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384")
+	require_Equal(t, tls.CipherSuiteName(0xc02c), "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384")
+	require_Equal(t, tls.CipherSuiteName(0x1301), "TLS_AES_128_GCM_SHA256")
+	require_Equal(t, tls.CipherSuiteName(0x1302), "TLS_AES_256_GCM_SHA384")
+	require_Equal(t, tls.CipherSuiteName(0x1303), "TLS_CHACHA20_POLY1305_SHA256")
+	require_Equal(t, tls.CipherSuiteName(0x9999), "0x9999")
 }
 
 func TestGetConnectURLs(t *testing.T) {
@@ -858,13 +921,13 @@ func TestLameDuckMode(t *testing.T) {
 	// of connections in the server A to be 0, the polling of connection closed may
 	// need a bit more time.
 	checkFor(t, time.Second, 15*time.Millisecond, func() error {
-		cz := pollConz(t, srvA, 1, "", &ConnzOptions{State: ConnClosed})
+		cz := pollConnz(t, srvA, 1, "", &ConnzOptions{State: ConnClosed})
 		if n := len(cz.Conns); n != total {
 			return fmt.Errorf("expected %v closed connections, got %v", total, n)
 		}
 		return nil
 	})
-	cz := pollConz(t, srvA, 1, "", &ConnzOptions{State: ConnClosed})
+	cz := pollConnz(t, srvA, 1, "", &ConnzOptions{State: ConnClosed})
 	if n := len(cz.Conns); n != total {
 		t.Fatalf("Expected %v closed connections, got %v", total, n)
 	}
@@ -1046,6 +1109,8 @@ func TestLameDuckModeInfo(t *testing.T) {
 
 	getInfo(false)
 	c.Write([]byte("CONNECT {\"protocol\":1,\"verbose\":false}\r\nPING\r\n"))
+	// Consume both the first PONG and INFO in response to the Connect.
+	client.ReadString('\n')
 	client.ReadString('\n')
 
 	optsB := testWSOptions()
@@ -2233,5 +2298,76 @@ func TestServerClientURL(t *testing.T) {
 		s, err := NewServer(o)
 		require_NoError(t, err)
 		require_Equal(t, s.ClientURL(), expected)
+	}
+}
+
+// This is a test that guards against using goccy/go-json.
+// At least until it's fully compatible with std encoding/json, and we've thoroughly tested it.
+// This is just one bug (at the time of writing) that results in a panic.
+// https://github.com/goccy/go-json/issues/519
+func TestServerJsonMarshalNestedStructsPanic(t *testing.T) {
+	type Item struct {
+		A string `json:"a"`
+		B string `json:"b,omitempty"`
+	}
+
+	type Detail struct {
+		I Item `json:"i"`
+	}
+
+	type Body struct {
+		Payload *Detail `json:"p,omitempty"`
+	}
+
+	b, err := json.Marshal(Body{Payload: &Detail{I: Item{A: "a", B: "b"}}})
+	require_NoError(t, err)
+	require_Equal(t, string(b), "{\"p\":{\"i\":{\"a\":\"a\",\"b\":\"b\"}}}")
+}
+
+func TestBuildinfoFormatRevision(t *testing.T) {
+	tests := []struct {
+		name     string
+		revision string
+		expected string
+	}{
+		{
+			name:     "Git-like longer version",
+			revision: "abc123def456789",
+			expected: "abc123d",
+		},
+		{
+			name:     "Git-like exactly 7 chars",
+			revision: "abc123d",
+			expected: "abc123d",
+		},
+		{
+			name:     "SVN shorter revision",
+			revision: "1234",
+			expected: "1234",
+		},
+		{
+			name:     "SVN single digit",
+			revision: "5",
+			expected: "5",
+		},
+		{
+			name:     "Empty revision",
+			revision: "",
+			expected: "",
+		},
+		{
+			name:     "6 character revision",
+			revision: "abc123",
+			expected: "abc123",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := formatRevision(tt.revision)
+			if result != tt.expected {
+				t.Errorf("formatRevision(%q) = %q, expected %q", tt.revision, result, tt.expected)
+			}
+		})
 	}
 }

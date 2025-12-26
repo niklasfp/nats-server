@@ -1,4 +1,4 @@
-// Copyright 2017-2022 The NATS Authors
+// Copyright 2017-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -151,7 +151,8 @@ func TestConfigReloadUnsupported(t *testing.T) {
 			Host: "127.0.0.1",
 			Port: -1,
 		},
-		NoSigs: true,
+		NoSigs:       true,
+		configDigest: "sha256:3c5c4141f56274bcfa801f2d7326ec64d5eabddd9e6d4f9a06ed167315a57f55",
 	}
 	setBaselineOptions(golden)
 
@@ -223,7 +224,8 @@ func TestConfigReloadInvalidConfig(t *testing.T) {
 			Host: "127.0.0.1",
 			Port: -1,
 		},
-		NoSigs: true,
+		NoSigs:       true,
+		configDigest: "sha256:3c5c4141f56274bcfa801f2d7326ec64d5eabddd9e6d4f9a06ed167315a57f55",
 	}
 	setBaselineOptions(golden)
 
@@ -286,7 +288,8 @@ func TestConfigReload(t *testing.T) {
 			Host: "127.0.0.1",
 			Port: server.ClusterAddr().Port,
 		},
-		NoSigs: true,
+		NoSigs:       true,
+		configDigest: "sha256:3c5c4141f56274bcfa801f2d7326ec64d5eabddd9e6d4f9a06ed167315a57f55",
 	}
 	setBaselineOptions(golden)
 
@@ -371,6 +374,10 @@ func TestConfigReload(t *testing.T) {
 	}
 	if updated.MaxPayload != 1024 {
 		t.Fatalf("MaxPayload is incorrect.\nexpected 1024\ngot: %d", updated.MaxPayload)
+	}
+	expectedMetadata := map[string]string{"key1": "value1", "key2": "value2"}
+	if !reflect.DeepEqual(expectedMetadata, updated.Metadata) {
+		t.Fatalf("Metadata is incorrect.\nexpected: %v\ngot: %v", expectedMetadata, updated.Metadata)
 	}
 
 	if reloaded := server.ConfigTime(); !reloaded.After(loaded) {
@@ -592,6 +599,56 @@ func TestConfigReloadRotateTLSMultiCert(t *testing.T) {
 	if bytes.Equal(certB, certC) {
 		t.Error("Expected a different cert")
 	}
+}
+
+func TestConfigReloadDefaultSentinel(t *testing.T) {
+	var err error
+	preload := make(map[string]string)
+
+	_, sysPub, sysAC := NewJwtAccountClaim("SYS")
+	preload[sysPub], err = sysAC.Encode(oKp)
+	require_NoError(t, err)
+
+	aKP, aPub, aAC := NewJwtAccountClaim("A")
+	preload[aPub], err = aAC.Encode(oKp)
+	require_NoError(t, err)
+
+	preloadConfig, err := json.MarshalIndent(preload, "", " ")
+	require_NoError(t, err)
+
+	uKP, err := nkeys.CreateUser()
+	require_NoError(t, err)
+	uPub, err := uKP.PublicKey()
+	require_NoError(t, err)
+	uc := jwt.NewUserClaims(uPub)
+	uc.BearerToken = true
+	uc.Name = "sentinel"
+	sentinelToken, err := uc.Encode(aKP)
+	require_NoError(t, err)
+	content := func() []byte {
+		return []byte(fmt.Sprintf(`
+            listen: 127.0.0.1:4747
+            operator: %s
+            system_account: %s
+            resolver: MEM
+            resolver_preload: %s
+			default_sentinel: %s
+`, ojwt, sysPub, preloadConfig, sentinelToken))
+	}
+
+	server, opts, config := runReloadServerWithContent(t, content())
+	defer server.Shutdown()
+	require_Equal(t, opts.DefaultSentinel, sentinelToken)
+
+	uc.Name = "sentinel-updated"
+	sentinelToken, err = uc.Encode(aKP)
+	require_NoError(t, err)
+	changeCurrentConfigContentWithNewContent(t, config, content())
+	if err := server.Reload(); err != nil {
+		t.Fatalf("Error reloading config: %v", err)
+	}
+	opts = server.getOpts()
+	require_Equal(t, opts.DefaultSentinel, sentinelToken)
 }
 
 // Ensure Reload supports single user authentication config changes. Test this
@@ -3805,9 +3862,53 @@ func TestConfigReloadBoolFlags(t *testing.T) {
 			true,
 			func() bool { return opts.TraceVerbose },
 		},
+		// --js override
+		{
+			"jetstream_not_in_config_no_override",
+			"",
+			nil,
+			false,
+			func() bool { return opts.JetStream },
+		},
+		{
+			"jetstream_not_in_config_override_true",
+			"",
+			[]string{"--js"},
+			true,
+			func() bool { return opts.JetStream },
+		},
+		{
+			"jetstream_false_in_config_no_override",
+			"jetstream: false",
+			nil,
+			false,
+			func() bool { return opts.JetStream },
+		},
+		{
+			"jetstream_false_in_config_override_true",
+			"jetstream: false",
+			[]string{"--js"},
+			true,
+			func() bool { return opts.JetStream },
+		},
+		{
+			"jetstream_true_in_config_no_override",
+			"jetstream: true",
+			nil,
+			true,
+			func() bool { return opts.JetStream },
+		},
+		{
+			"jetstream_true_in_config_override_false",
+			"jetstream: true",
+			[]string{"--js=false"},
+			false,
+			func() bool { return opts.JetStream },
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			conf := createConfFile(t, []byte(fmt.Sprintf(template, logfile, test.content)))
+			content := fmt.Sprintf(template, logfile, test.content)
+			conf := createConfFile(t, []byte(content))
 
 			fs := flag.NewFlagSet("test", flag.ContinueOnError)
 			var args []string
@@ -3826,9 +3927,15 @@ func TestConfigReloadBoolFlags(t *testing.T) {
 			if test.val() != test.expected {
 				t.Fatalf("Expected to be set to %v, got %v", test.expected, test.val())
 			}
-			if err := s.Reload(); err != nil {
-				t.Fatalf("Error on reload: %v", err)
-			}
+			// Do a config reload with a modified config file so that s.Reload()
+			// actually does something (otherwise it would not because config
+			// digest would not have changed). We could alternatively change
+			// s.opts.configDigest to the empty string.
+			reloadUpdateConfig(t, s, conf, content+`
+				max_connections: 1000
+			`)
+			// Have `opts` now point to the new options after the Reload()
+			opts = s.getOpts()
 			if test.val() != test.expected {
 				t.Fatalf("Expected to be set to %v, got %v", test.expected, test.val())
 			}
@@ -4054,6 +4161,11 @@ func TestConfigReloadAndVarz(t *testing.T) {
 	if v.MaxConn != DEFAULT_MAX_CONNECTIONS {
 		t.Fatalf("MaxConn should be %v, got %v", DEFAULT_MAX_CONNECTIONS, v.MaxConn)
 	}
+	got := v.ConfigDigest
+	expected := "sha256:7ea4cc5c6864139d814ce940a40ee6546b7ac5285eec3c390a4ce11e34dc1102"
+	if got != expected {
+		t.Fatalf("got: %v, expected: %v", got, expected)
+	}
 
 	changeCurrentConfigContentWithNewContent(t, conf, []byte(fmt.Sprintf(template, "max_connections: 10")))
 
@@ -4070,6 +4182,11 @@ func TestConfigReloadAndVarz(t *testing.T) {
 	}
 	if v.MaxConn != 10 {
 		t.Fatalf("MaxConn should be 10, got %v", v.MaxConn)
+	}
+	got = v.ConfigDigest
+	expected = "sha256:508a26309068f62c3022aa8951e712ed8ff5dd6f2360f727ad8242a2a233176e"
+	if got != expected {
+		t.Fatalf("got: %v, expected: %v", got, expected)
 	}
 }
 
@@ -5362,6 +5479,41 @@ func TestConfigReloadRoutePoolAndPerAccount(t *testing.T) {
 			t.Fatalf("Expected 0 pending messages, got %v for accIdx=%d sub=%q", n, i, sub.Subject)
 		}
 	}
+}
+
+func TestConfigReloadRoutePoolAndPerAccountNoPanicIfFirstAdded(t *testing.T) {
+	tmpl := `
+		port: -1
+		server_name: "%s"
+		accounts {
+			A { users: [{user: "user1", password: "pwd"}] }
+			B { users: [{user: "user2", password: "pwd"}] }
+		}
+		cluster {
+				name: "local"
+				listen: 127.0.0.1:-1
+				pool_size: 2
+				%s
+				%s
+		}
+		no_sys_acc: true
+	`
+	conf1 := createConfFile(t, fmt.Appendf(nil, tmpl, "A", _EMPTY_, _EMPTY_))
+	s1, o1 := RunServerWithConfig(conf1)
+	defer s1.Shutdown()
+
+	route := fmt.Sprintf("routes: [\"nats://127.0.0.1:%d\"]", o1.Cluster.Port)
+	conf2 := createConfFile(t, fmt.Appendf(nil, tmpl, "B", _EMPTY_, route))
+	s2, _ := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+
+	reloadUpdateConfig(t, s1, conf1, fmt.Sprintf(tmpl, "A", "accounts:[\"A\"]", _EMPTY_))
+	reloadUpdateConfig(t, s2, conf2, fmt.Sprintf(tmpl, "B", "accounts:[\"A\"]", route))
+
+	time.Sleep(50 * time.Millisecond)
+	checkClusterFormed(t, s1, s2)
 }
 
 func TestConfigReloadRoutePoolCannotBeDisabledIfAccountsPresent(t *testing.T) {

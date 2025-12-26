@@ -1,4 +1,4 @@
-// Copyright 2018-2020 The NATS Authors
+// Copyright 2018-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -4281,7 +4281,7 @@ func TestJWTLimits(t *testing.T) {
 	t.Run("subs", func(t *testing.T) {
 		creds := createUserWithLimit(t, kp, doNotExpire, func(j *jwt.UserPermissionLimits) { j.Subs = 1 })
 		c := natsConnect(t, sA.ClientURL(), nats.UserCredentials(creds),
-			nats.DisconnectErrHandler(func(conn *nats.Conn, err error) {
+			nats.ErrorHandler(func(conn *nats.Conn, s *nats.Subscription, err error) {
 				if e := conn.LastError(); e != nil && strings.Contains(e.Error(), "maximum subscriptions exceeded") {
 					errChan <- struct{}{}
 				}
@@ -4312,7 +4312,7 @@ func TestJWTLimits(t *testing.T) {
 	})
 }
 
-func TestJwtTemplates(t *testing.T) {
+func TestJWTTemplates(t *testing.T) {
 	kp, _ := nkeys.CreateAccount()
 	aPub, _ := kp.PublicKey()
 	ukp, _ := nkeys.CreateUser()
@@ -4363,7 +4363,37 @@ func TestJwtTemplates(t *testing.T) {
 	require_Contains(t, err.Error(), "generated invalid subject")
 }
 
-func TestJwtTemplateGoodTagAfterBadTag(t *testing.T) {
+func TestJWTInLineTemplates(t *testing.T) {
+	kp, _ := nkeys.CreateAccount()
+	aPub, _ := kp.PublicKey()
+	ukp, _ := nkeys.CreateUser()
+	upub, _ := ukp.PublicKey()
+	uclaim := newJWTTestUserClaims()
+	uclaim.Name = "myname"
+	uclaim.Subject = upub
+	uclaim.SetScoped(true)
+	uclaim.IssuerAccount = aPub
+	uclaim.Tags.Add("bucket:a")
+
+	lim := jwt.UserPermissionLimits{}
+	lim.Pub.Allow.Add("$JS.API.STREAM.INFO.KV_{{tag(bucket)}}")
+	acc := &Account{nameTag: "accname", tags: []string{"acc:acc1", "acc:acc2"}}
+
+	resLim, err := processUserPermissionsTemplate(lim, uclaim, acc)
+	require_NoError(t, err)
+
+	test := func(expectedSubjects []string, res jwt.StringList) {
+		t.Helper()
+		require_True(t, len(res) == len(expectedSubjects))
+		for _, expetedSubj := range expectedSubjects {
+			require_True(t, res.Contains(expetedSubj))
+		}
+	}
+
+	test(resLim.Pub.Allow, []string{"$JS.API.STREAM.INFO.KV_a"})
+}
+
+func TestJWTTemplateGoodTagAfterBadTag(t *testing.T) {
 	kp, _ := nkeys.CreateAccount()
 	aPub, _ := kp.PublicKey()
 	ukp, _ := nkeys.CreateUser()
@@ -4436,7 +4466,7 @@ func TestJWTLimitsTemplate(t *testing.T) {
 	t.Run("fail", func(t *testing.T) {
 		c := natsConnect(t, sA.ClientURL(), nats.UserCredentials(creds),
 			nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
-				if strings.Contains(err.Error(), `nats: Permissions Violation for Publish to "foo.othername"`) {
+				if strings.Contains(err.Error(), `Permissions Violation for Publish to "foo.othername"`) {
 					errChan <- struct{}{}
 				}
 			}))
@@ -4568,7 +4598,7 @@ func TestJWTUserRevocation(t *testing.T) {
 			t.Fatalf("Expected connection to have failed")
 		}
 		m := <-ncChan
-		require_Len(t, strings.Count(string(m.Data), apub), 2)
+		require_Len(t, strings.Count(string(m.Data), apub), 3)
 		require_True(t, strings.Contains(string(m.Data), `"jwt":"eyJ0`))
 		// try again with old credentials. Expected to fail
 		if nc1, err := nats.Connect(srv.ClientURL(), nats.UserCredentials(aCreds1)); err == nil {
@@ -5762,7 +5792,7 @@ func TestJWTQueuePermissions(t *testing.T) {
 	}
 }
 
-func TestJWScopedSigningKeys(t *testing.T) {
+func TestJWTScopedSigningKeys(t *testing.T) {
 	sysKp, syspub := createKey(t)
 	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
 	sysCreds := newUser(t, sysKp)
@@ -6189,8 +6219,7 @@ func TestJWTAccountProtectedImport(t *testing.T) {
 
 		// ensure service fails
 		_, err = ncImp.Request(srvcSub, []byte("hello"), time.Second)
-		require_Error(t, err)
-		require_Contains(t, err.Error(), "timeout")
+		require_Error(t, err, nats.ErrNoResponders)
 		s.AccountResolver().Store(exportPub, exportJWTOn)
 		// ensure stream fails
 		err = ncExp.Publish(strmSub, []byte("hello"))
@@ -6226,6 +6255,7 @@ func TestJWTClaimsUpdateWithHeaders(t *testing.T) {
 		resolver: {
 			type: full
 			dir: '%s'
+			allow_delete: true
 		}
     `, ojwt, spub, dirSrv)))
 
@@ -6251,6 +6281,27 @@ func TestJWTClaimsUpdateWithHeaders(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	var cz zapi
+	if err := json.Unmarshal(resp.Data, &cz); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if cz.Error != nil {
+		t.Fatalf("Unexpected error: %+v", cz.Error)
+	}
+
+	// Pass claims delete with headers.
+	opk, err := oKp.PublicKey()
+	require_NoError(t, err)
+	c := jwt.NewGenericClaims(opk)
+	c.Data["accounts"] = []string{apub}
+	djwt, err := c.Encode(oKp)
+	require_NoError(t, err)
+	msg.Subject = "$SYS.REQ.CLAIMS.DELETE"
+	msg.Data = []byte(djwt)
+	resp, err = sc.RequestMsg(msg, time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	cz = zapi{}
 	if err := json.Unmarshal(resp.Data, &cz); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -6486,7 +6537,7 @@ func TestJWTAccountConnzAccessAfterClaimUpdate(t *testing.T) {
 	doRequest()
 }
 
-func TestAccountWeightedMappingInSuperCluster(t *testing.T) {
+func TestJWTAccountWeightedMappingInSuperCluster(t *testing.T) {
 	skp, spub := createKey(t)
 	sysClaim := jwt.NewAccountClaims(spub)
 	sysClaim.Name = "SYS"
@@ -6616,7 +6667,7 @@ func TestAccountWeightedMappingInSuperCluster(t *testing.T) {
 	}
 }
 
-func TestServerOperatorModeNoAuthRequired(t *testing.T) {
+func TestJWTServerOperatorModeNoAuthRequired(t *testing.T) {
 	_, spub := createKey(t)
 	sysClaim := jwt.NewAccountClaims(spub)
 	sysClaim.Name = "$SYS"
@@ -6665,7 +6716,7 @@ func TestServerOperatorModeNoAuthRequired(t *testing.T) {
 	require_True(t, nc.AuthRequired())
 }
 
-func TestServerOperatorModeUserInfoExpiration(t *testing.T) {
+func TestJWTServerOperatorModeUserInfoExpiration(t *testing.T) {
 	_, spub := createKey(t)
 	sysClaim := jwt.NewAccountClaims(spub)
 	sysClaim.Name = "$SYS"
@@ -7026,6 +7077,7 @@ func TestJWTImportsOnServerRestartAndClientsReconnect(t *testing.T) {
 		for range time.NewTicker(200 * time.Millisecond).C {
 			select {
 			case <-ctx.Done():
+				return
 			default:
 			}
 			send(t)
@@ -7085,5 +7137,351 @@ func TestJWTImportsOnServerRestartAndClientsReconnect(t *testing.T) {
 		defer s.Shutdown()
 		time.Sleep(2 * time.Second)
 		receive(t)
+	}
+}
+
+func TestDefaultSentinelUser(t *testing.T) {
+	var err error
+	preload := make(map[string]string)
+
+	_, sysPub, sysAC := NewJwtAccountClaim("SYS")
+	preload[sysPub], err = sysAC.Encode(oKp)
+	require_NoError(t, err)
+
+	aKP, aPub, aAC := NewJwtAccountClaim("A")
+	aScopedKP, err := nkeys.CreateAccount()
+	require_NoError(t, err)
+	aScopedPK, err := aScopedKP.PublicKey()
+	require_NoError(t, err)
+
+	sentinelScope := jwt.NewUserScope()
+	sentinelScope.Key = aScopedPK
+	sentinelScope.Role = "sentinel"
+	sentinelScope.Description = "Sentinel Role"
+	sentinelScope.Template = jwt.UserPermissionLimits{
+		BearerToken: true,
+		Permissions: jwt.Permissions{
+			Pub: jwt.Permission{Deny: []string{">"}},
+			Sub: jwt.Permission{Deny: []string{">"}},
+		},
+	}
+	aAC.SigningKeys.AddScopedSigner(sentinelScope)
+
+	preload[aPub], err = aAC.Encode(oKp)
+	require_NoError(t, err)
+
+	preloadConfig, err := json.MarshalIndent(preload, "", " ")
+	require_NoError(t, err)
+
+	// test that the user will be rejected
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+            listen: 127.0.0.1:4747
+            operator: %s
+            system_account: %s
+            resolver: MEM
+            resolver_preload: %s
+`, ojwt, sysPub, preloadConfig)))
+
+	ns, _ := RunServerWithConfig(conf)
+	defer ns.Shutdown()
+	_, err = nats.Connect(ns.ClientURL(), nats.MaxReconnects(0))
+	require_Error(t, err)
+	require_True(t, errors.Is(err, nats.ErrAuthorization))
+	ns.Shutdown()
+
+	// test that user can connect
+	uKP, err := nkeys.CreateUser()
+	require_NoError(t, err)
+	uPub, err := uKP.PublicKey()
+	require_NoError(t, err)
+	uc := jwt.NewUserClaims(uPub)
+	uc.BearerToken = false
+	uc.Name = "sentinel"
+	sentinelToken, err := uc.Encode(aKP)
+	require_NoError(t, err)
+	conf = createConfFile(t, []byte(fmt.Sprintf(`
+            listen: 127.0.0.1:4747
+            operator: %s
+            system_account: %s
+            resolver: MEM
+            resolver_preload: %s
+			default_sentinel: %s
+`, ojwt, sysPub, preloadConfig, sentinelToken)))
+
+	// test non-bearer sentinel is rejected
+	opts, err := ProcessConfigFile(conf)
+	require_NoError(t, err)
+	_, err = NewServer(opts)
+	require_Error(t, err, fmt.Errorf("default sentinel must be a bearer token"))
+
+	// correct and start server
+	uc.BearerToken = true
+	sentinelToken, err = uc.Encode(aKP)
+	require_NoError(t, err)
+	conf = createConfFile(t, []byte(fmt.Sprintf(`
+            listen: 127.0.0.1:4747
+            operator: %s
+            system_account: %s
+            resolver: MEM
+            resolver_preload: %s
+			default_sentinel: %s
+`, ojwt, sysPub, preloadConfig, sentinelToken)))
+
+	ns, _ = RunServerWithConfig(conf)
+	nc, err := nats.Connect(ns.ClientURL())
+	require_NoError(t, err)
+	defer nc.Close()
+
+	r, err := nc.Request("$SYS.REQ.USER.INFO", nil, time.Second*5)
+	require_NoError(t, err)
+	type SR struct {
+		Data UserInfo `json:"data"`
+	}
+	var ui SR
+	require_NoError(t, json.Unmarshal(r.Data, &ui))
+	require_Equal(t, ui.Data.UserID, uPub)
+	ns.Shutdown()
+
+	// now lets make a sentinel that is a scoped user with bearer token
+	uc = jwt.NewUserClaims(uPub)
+	uc.IssuerAccount = aPub
+	uc.UserPermissionLimits = jwt.UserPermissionLimits{}
+
+	sentinelToken, err = uc.Encode(aScopedKP)
+	require_NoError(t, err)
+	conf = createConfFile(t, []byte(fmt.Sprintf(`
+            listen: 127.0.0.1:4747
+            operator: %s
+            system_account: %s
+            resolver: MEM
+            resolver_preload: %s
+			default_sentinel: %s
+`, ojwt, sysPub, preloadConfig, sentinelToken)))
+	ns, _ = RunServerWithConfig(conf)
+	defer ns.Shutdown()
+	nc, err = nats.Connect(ns.ClientURL())
+	require_NoError(t, err)
+	defer nc.Close()
+
+}
+
+func TestJWTUpdateAccountClaimsStreamAndServiceImportDeadlock(t *testing.T) {
+	for _, exportType := range []jwt.ExportType{jwt.Stream, jwt.Service} {
+		t.Run(exportType.String(), func(t *testing.T) {
+			s := opTrustBasicSetup()
+			defer s.Shutdown()
+			buildMemAccResolver(s)
+
+			// Get operator.
+			okp, err := nkeys.FromSeed(oSeed)
+			require_NoError(t, err)
+
+			type Acc struct {
+				pub string
+				ac  *jwt.AccountClaims
+				a   *Account
+				c   *client
+			}
+
+			// Create accounts.
+			var accs []*Acc
+			numAccounts := 10
+			for i := 0; i < numAccounts; i++ {
+				aKp, err := nkeys.CreateAccount()
+				require_NoError(t, err)
+				aPub, err := aKp.PublicKey()
+				require_NoError(t, err)
+				aAC := jwt.NewAccountClaims(aPub)
+				aJWT, err := aAC.Encode(okp)
+				require_NoError(t, err)
+				addAccountToMemResolver(s, aPub, aJWT)
+
+				aAcc, err := s.LookupAccount(aPub)
+				require_NoError(t, err)
+
+				aAcc.mu.Lock()
+				c := aAcc.internalClient()
+				aAcc.mu.Unlock()
+				aAcc.addClient(c)
+
+				accs = append(accs, &Acc{aPub, aAC, aAcc, c})
+			}
+
+			addImportExport := func(i int, acc *Acc) {
+				localSubject := fmt.Sprintf("%s.%d", acc.pub, i)
+				acc.ac.Exports.Add(&jwt.Export{Subject: jwt.Subject(localSubject), Type: exportType})
+				for _, oAcc := range accs {
+					if acc.pub == oAcc.pub {
+						continue
+					}
+					externalSubject := fmt.Sprintf("%s.%d", oAcc.pub, i)
+					acc.ac.Imports.Add(&jwt.Import{Account: oAcc.pub, Subject: jwt.Subject(externalSubject), Type: exportType})
+				}
+			}
+			test := func(i int) {
+				var start sync.WaitGroup
+				var release sync.WaitGroup
+				var finish sync.WaitGroup
+				start.Add(numAccounts)
+				release.Add(1)
+				finish.Add(numAccounts)
+
+				// Add imports/exports to both accounts and update in parallel, should not deadlock.
+				for _, acc := range accs {
+					acc := acc
+					go func() {
+						defer finish.Done()
+						addImportExport(i, acc)
+						jwt, err := acc.ac.Encode(okp)
+						addAccountToMemResolver(s, acc.pub, jwt)
+						start.Done()
+						require_NoError(t, err)
+
+						release.Wait()
+						s.UpdateAccountClaims(acc.a, acc.ac)
+					}()
+				}
+
+				start.Wait()
+
+				// Lock all clients, once we release below we'll get all claim updates
+				// in the same place after initial checks.
+				for _, acc := range accs {
+					acc.c.mu.Lock()
+				}
+				release.Done()
+
+				// Wait some time for them to reach that point and be blocked on the client lock.
+				time.Sleep(time.Second)
+				for _, acc := range accs {
+					acc.c.mu.Unlock()
+				}
+
+				// Eventually all goroutines should finish.
+				finish.Wait()
+			}
+
+			// Repeat test multiple times, increasing the amount of imports/exports along the way.
+			for i := 0; i < 30; i++ {
+				test(i)
+			}
+		})
+	}
+}
+
+func TestJWTJetStreamClientsExcludedForMaxConnsUpdate(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	sysCreds := newUser(t, sysKp)
+
+	accKp, accPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(accPub)
+	accClaim.Name = "acc"
+	accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{
+		DiskStorage: 1100, MemoryStorage: 0, Consumer: 2, Streams: 2}
+	accClaim.Limits.Conn = 5
+	accJwt1 := encodeClaim(t, accClaim, accPub)
+	accCreds := newUser(t, accKp)
+
+	storeDir := t.TempDir()
+
+	dirSrv := t.TempDir()
+	cf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		server_name: s1
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+		leaf {
+			listen: 127.0.0.1:-1
+		}
+		operator: %s
+		system_account: %s
+		resolver: {
+			type: full
+			dir: '%s'
+		}
+	`, storeDir, ojwt, syspub, dirSrv)))
+
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	updateJwt(t, s.ClientURL(), sysCreds, sysJwt, 1)
+	updateJwt(t, s.ClientURL(), sysCreds, accJwt1, 1)
+
+	nc, js := jsClientConnectURL(t, s.ClientURL(), nats.UserCredentials(accCreds))
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Replicas: 1, Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	_, err = js.Publish("foo", nil)
+	require_NoError(t, err)
+
+	accClaim.Limits.Conn = 1
+	accJwt1 = encodeClaim(t, accClaim, accPub)
+	updateJwt(t, s.ClientURL(), sysCreds, accJwt1, 1)
+
+	// Manually reconnect.
+	nc.Close()
+	nc, js = jsClientConnectURL(t, s.ClientURL(), nats.UserCredentials(accCreds))
+	defer nc.Close()
+
+	_, err = js.Publish("foo", nil)
+	require_NoError(t, err)
+}
+
+func TestJWTClusterUserInfoContainsPermissions(t *testing.T) {
+	tmpl := `
+			listen: 127.0.0.1:-1
+			server_name: %s
+			jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+			cluster {
+				name: %s
+				listen: 127.0.0.1:%d
+				routes = [%s]
+			}
+	`
+	opFrag := `
+			operator: %s
+			system_account: %s
+			resolver: { type: MEM }
+			resolver_preload = {
+				%s : %s
+				%s : %s
+			}
+		`
+
+	_, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+
+	accKp, aExpPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(aExpPub)
+	accClaim.DefaultPermissions.Sub = jwt.Permission{
+		Deny: []string{"foo"},
+	}
+	accJwt := encodeClaim(t, accClaim, aExpPub)
+	accCreds := newUser(t, accKp)
+
+	template := tmpl + fmt.Sprintf(opFrag, ojwt, syspub, syspub, sysJwt, aExpPub, accJwt)
+	c := createJetStreamClusterWithTemplate(t, template, "R3S", 3)
+	defer c.shutdown()
+
+	// Since it's a bit of a race whether the local server responds via the
+	// service import before a remote server does, we need to keep trying.
+	// In 1000 attempts it is quite easy to reproduce the problem.
+	test := func() {
+		nc, _ := jsClientConnect(t, c.randomServer(), nats.UserCredentials(accCreds))
+		defer nc.Close()
+
+		resp, err := nc.Request(userDirectInfoSubj, nil, time.Second)
+		require_NoError(t, err)
+
+		response := ServerAPIResponse{Data: &UserInfo{}}
+		require_NoError(t, json.Unmarshal(resp.Data, &response))
+
+		userInfo := response.Data.(*UserInfo)
+		require_NotNil(t, userInfo.Permissions)
+	}
+	for range 1000 {
+		test()
 	}
 }

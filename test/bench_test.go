@@ -1,4 +1,4 @@
-// Copyright 2012-2020 The NATS Authors
+// Copyright 2012-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -304,10 +304,6 @@ func addServiceImports(b *testing.B, s *server.Server) {
 	// Add a bunch of service exports with wildcards, similar to JS.
 	var exports = []string{
 		server.JSApiAccountInfo,
-		server.JSApiTemplateCreate,
-		server.JSApiTemplates,
-		server.JSApiTemplateInfo,
-		server.JSApiTemplateDelete,
 		server.JSApiStreamCreate,
 		server.JSApiStreamUpdate,
 		server.JSApiStreams,

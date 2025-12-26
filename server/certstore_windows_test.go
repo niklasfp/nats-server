@@ -1,4 +1,4 @@
-// Copyright 2022-2024 The NATS Authors
+// Copyright 2022-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,6 +16,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net/url"
 	"os"
@@ -28,9 +29,12 @@ import (
 )
 
 func runPowershellScript(scriptFile string, args []string) error {
-	_ = args
 	psExec, _ := exec.LookPath("powershell.exe")
+
 	execArgs := []string{psExec, "-command", fmt.Sprintf("& '%s'", scriptFile)}
+	if len(args) > 0 {
+		execArgs = append(execArgs, args...)
+	}
 
 	cmdImport := &exec.Cmd{
 		Path:   psExec,
@@ -152,6 +156,7 @@ func TestLeafTLSWindowsCertStore(t *testing.T) {
 		{"WindowsCurrentUser", "Subject", "example.com", "\"NATS CA\"", 1},
 		{"WindowsCurrentUser", "Issuer", "NATS CA", "\"NATS CA\"", 1},
 		{"WindowsCurrentUser", "Issuer", "Frodo Baggins, Inc.", "\"NATS CA\"", 0},
+		{"WindowsCurrentUser", "Thumbprint", "7e44f478114a2e29b98b00beb1b3687d8dc0e481", "\"NATS CA\"", 0},
 		// Test CAs, NATS CA is valid, others are missing
 		{"WindowsCurrentUser", "Subject", "example.com", "[\"NATS CA\"]", 1},
 		{"WindowsCurrentUser", "Subject", "example.com", "[\"GlobalSign\"]", 0},
@@ -182,7 +187,7 @@ func TestLeafTLSWindowsCertStore(t *testing.T) {
 }
 
 // TestServerTLSWindowsCertStore tests the topology of a NATS server requiring TLS and gettings it own server
-// cert identiy (as used when accepting NATS client connections and negotiating TLS) from Windows certificate store.
+// cert identity (as used when accepting NATS client connections and negotiating TLS) from Windows certificate store.
 func TestServerTLSWindowsCertStore(t *testing.T) {
 
 	// Server Identity (server.pem)
@@ -248,6 +253,98 @@ func TestServerTLSWindowsCertStore(t *testing.T) {
 				}
 				nc.Close()
 			}
+		})
+	}
+}
+
+// TestServerIgnoreExpiredCerts tests if the server skips expired certificates in configuration, and finds non-expired ones
+func TestServerIgnoreExpiredCerts(t *testing.T) {
+
+	// Server Identities: expired.pem; not-expired.pem
+	// Issuer: OU = NATS.io, CN = localhost
+	// Subject: OU = NATS.io Operators, CN = localhost
+
+	testCases := []struct {
+		certFile string
+		expect   bool
+	}{
+		{"expired.p12", false},
+		{"not-expired.p12", true},
+	}
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("Server certificate: %s", tc.certFile), func(t *testing.T) {
+			// Make sure windows cert store is reset to avoid conflict with other tests
+			err := runPowershellScript("../test/configs/certs/tlsauth/certstore/delete-cert-from-store.ps1", nil)
+			if err != nil {
+				t.Fatalf("expected powershell cert delete to succeed: %s", err.Error())
+			}
+
+			// Provision Windows cert store with server cert and secret
+			err = runPowershellScript("../test/configs/certs/tlsauth/certstore/import-p12-server.ps1", []string{tc.certFile})
+			if err != nil {
+				t.Fatalf("expected powershell provision to succeed: %s", err.Error())
+			}
+			// Fire up the server
+			srvConfig := createConfFile(t, []byte(`
+			listen: "localhost:-1"
+			tls {
+				cert_store: "WindowsCurrentUser"
+				cert_match_by: "Subject"
+				cert_match: "NATS.io Operators"
+				cert_match_skip_invalid: true
+				timeout: 5
+			}
+			`))
+			defer removeFile(t, srvConfig)
+			cfg, _ := ProcessConfigFile(srvConfig)
+			if (cfg != nil) == tc.expect {
+				return
+			}
+			if tc.expect == false {
+				t.Fatalf("expected server start to fail with expired certificate")
+			} else {
+				t.Fatalf("expected server to start with non expired certificate")
+			}
+		})
+	}
+}
+
+func TestWindowsTLS12ECDSA(t *testing.T) {
+	err := runPowershellScript("../test/configs/certs/tlsauth/certstore/import-p12-server.ps1", []string{"ecdsa_server.pfx"})
+	if err != nil {
+		t.Fatalf("expected powershell provision to succeed: %v", err)
+	}
+
+	config := createConfFile(t, []byte(`
+	listen: "localhost:-1"
+	tls {
+		cert_store: "WindowsCurrentUser"
+		cert_match_by: "Thumbprint"
+		cert_match: "4F8AF21756E5DBBD54619BBB6F3CC5D455ED4468"
+		cert_match_skip_invalid: true
+		timeout: 5
+	}
+	`))
+	defer removeFile(t, config)
+
+	srv, _ := RunServerWithConfig(config)
+	if srv == nil {
+		t.Fatalf("expected to be able start server with cert store configuration")
+	}
+	defer srv.Shutdown()
+
+	for name, version := range map[string]uint16{
+		"TLS 1.3": tls.VersionTLS13,
+		"TLS 1.2": tls.VersionTLS12,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tc := &tls.Config{MaxVersion: version, MinVersion: version, InsecureSkipVerify: true}
+
+			if _, err = nats.Connect(srv.clientConnectURLs[0], nats.Secure(tc)); err != nil {
+				t.Fatalf("connection with %s: %v", name, err)
+			}
+
+			t.Logf("successful connection with %s", name)
 		})
 	}
 }

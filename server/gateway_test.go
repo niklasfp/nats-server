@@ -1,4 +1,4 @@
-// Copyright 2018-2024 The NATS Authors
+// Copyright 2018-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -31,14 +31,17 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/nats-io/nats-server/v2/internal/ocsp"
 	"github.com/nats-io/nats-server/v2/logger"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
 	"golang.org/x/crypto/ocsp"
+
+	. "github.com/nats-io/nats-server/v2/internal/ocsp"
 )
 
 func init() {
 	gatewayConnectDelay = 15 * time.Millisecond
+	gatewayConnectMaxDelay = 15 * time.Millisecond
 	gatewayReconnectDelay = 15 * time.Millisecond
 }
 
@@ -804,12 +807,8 @@ func testFatalErrorOnStart(t *testing.T, o *Options, errTxt string) {
 	defer s.Shutdown()
 	l := &captureFatalLogger{fatalCh: make(chan string, 1)}
 	s.SetLogger(l, false, false)
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		s.Start()
-		wg.Done()
-	}()
+	// This does not block
+	s.Start()
 	select {
 	case e := <-l.fatalCh:
 		if !strings.Contains(e, errTxt) {
@@ -819,7 +818,7 @@ func testFatalErrorOnStart(t *testing.T, o *Options, errTxt string) {
 		t.Fatal("Should have got a fatal error")
 	}
 	s.Shutdown()
-	wg.Wait()
+	s.WaitForShutdown()
 }
 
 func TestGatewayListenError(t *testing.T) {
@@ -1446,6 +1445,62 @@ func TestGatewayImplicitReconnectHonorConnectRetries(t *testing.T) {
 	waitForInboundGateways(t, sb, 1, 2*time.Second)
 	waitForOutboundGateways(t, sc, 1, 2*time.Second)
 	waitForInboundGateways(t, sc, 1, 2*time.Second)
+}
+
+func TestGatewayReconnectExponentialBackoff(t *testing.T) {
+	oGatewayConnectDelay := gatewayConnectDelay
+	oGatewayConnectMaxDelay := gatewayConnectMaxDelay
+	gatewayConnectDelay = 500 * time.Millisecond
+	gatewayConnectMaxDelay = 2 * time.Second
+	defer func() {
+		gatewayConnectDelay = oGatewayConnectDelay
+		gatewayConnectMaxDelay = oGatewayConnectMaxDelay
+	}()
+
+	ob := testDefaultOptionsForGateway("B")
+	ob.ReconnectErrorReports = 1
+	ob.Gateway.ConnectRetries = 3
+	ob.Gateway.ConnectBackoff = true
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	l := &gwReconnAttemptLogger{errCh: make(chan string, 3)}
+	sb.SetLogger(l, true, false)
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	// Wait for the proper connections
+	waitForOutboundGateways(t, sa, 1, time.Second)
+	waitForOutboundGateways(t, sb, 1, time.Second)
+	waitForInboundGateways(t, sa, 1, time.Second)
+	waitForInboundGateways(t, sb, 1, time.Second)
+
+	// Remove initial delay before reconnect, and allow for some skew.
+	now := time.Now().Add(gatewayReconnectDelay).Add(-100 * time.Millisecond)
+	var delay time.Duration
+
+	// B will try to reconnect to A 3 times (we stop after attempts > ConnectRetries)
+	sa.Shutdown()
+	for i := 0; i < ob.Gateway.ConnectRetries+1; i++ {
+		select {
+		case <-l.errCh:
+			if since := time.Since(now); since < delay {
+				t.Fatalf("Expected delay to take %v, took %v", delay, since)
+			}
+			if delay == 0 {
+				delay = gatewayConnectDelay
+			} else {
+				delay *= 2
+			}
+			if delay > gatewayConnectMaxDelay {
+				delay = gatewayConnectMaxDelay
+			}
+		case <-time.After(gatewayConnectMaxDelay + time.Second):
+			t.Fatal("Did not attempt to reconnect")
+		}
+	}
 }
 
 func TestGatewayURLsFromClusterSentInINFO(t *testing.T) {
@@ -4730,19 +4785,19 @@ func TestGatewayServiceExportWithWildcards(t *testing.T) {
 			if !test.public {
 				accs = []*Account{barA1}
 			}
-			fooA1.AddServiceExport("ngs.update.*", accs)
+			require_NoError(t, fooA1.AddServiceExport("ngs.update.*", accs))
 			if !test.public {
 				accs = []*Account{barA2}
 			}
-			fooA2.AddServiceExport("ngs.update.*", accs)
+			require_NoError(t, fooA2.AddServiceExport("ngs.update.*", accs))
 			if !test.public {
 				accs = []*Account{barB1}
 			}
-			fooB1.AddServiceExport("ngs.update.*", accs)
+			require_NoError(t, fooB1.AddServiceExport("ngs.update.*", accs))
 			if !test.public {
 				accs = []*Account{barB2}
 			}
-			fooB2.AddServiceExport("ngs.update.*", accs)
+			require_NoError(t, fooB2.AddServiceExport("ngs.update.*", accs))
 
 			// Add import abilities to server B's bar account from foo.
 			if err := barB1.AddServiceImport(fooB1, "ngs.update", "ngs.update.$bar"); err != nil {
@@ -4775,6 +4830,9 @@ func TestGatewayServiceExportWithWildcards(t *testing.T) {
 
 			subB := natsSubSync(t, clientB, "reply")
 			natsFlush(t, clientB)
+
+			// Ensure the subscription is known by the server we're connected to.
+			time.Sleep(100 * time.Millisecond)
 
 			var msg *nats.Msg
 			var err error
@@ -4840,7 +4898,7 @@ func TestGatewayServiceExportWithWildcards(t *testing.T) {
 			checkSubs(t, fooB2, "B2", 1)
 			checkSubs(t, barB2, "B2", 2)
 
-			// Speed up exiration
+			// Speed up expiration
 			err = fooA1.SetServiceExportResponseThreshold("ngs.update.*", 10*time.Millisecond)
 			if err != nil {
 				t.Fatalf("Error setting response threshold: %v", err)
@@ -4863,7 +4921,7 @@ func TestGatewayServiceExportWithWildcards(t *testing.T) {
 				}
 			}
 
-			// Unsubsribe all and ensure counts go to 0.
+			// Unsubscribe all and ensure counts go to 0.
 			natsUnsub(t, subA)
 			natsFlush(t, clientA)
 			natsUnsub(t, subB)
@@ -4911,6 +4969,9 @@ func TestGatewayServiceExportWithWildcards(t *testing.T) {
 
 			subB = natsSubSync(t, clientB, "reply")
 			natsFlush(t, clientB)
+
+			// Ensure the subscription is known by the server we're connected to.
+			time.Sleep(100 * time.Millisecond)
 
 			for attempts := 1; attempts <= 2; attempts++ {
 				// Send the request from clientB on foo.request,
@@ -6455,6 +6516,65 @@ func TestGatewayTLSConfigReloadForRemote(t *testing.T) {
 	waitForOutboundGateways(t, srvB, 1, time.Second)
 }
 
+func TestGatewayTLSConfigReloadForImplicitRemote(t *testing.T) {
+	SetGatewaysSolicitDelay(5 * time.Millisecond)
+	defer ResetGatewaysSolicitDelay()
+
+	template := `
+		listen: 127.0.0.1:-1
+		gateway {
+			name: "A"
+			listen: "127.0.0.1:-1"
+			tls {
+				cert_file: "../test/configs/certs/srva-cert.pem"
+				key_file:  "../test/configs/certs/srva-key.pem"
+				%s
+				verify: true
+			}
+		}
+	`
+	confA := createConfFile(t, fmt.Appendf(nil, template, `ca_file:   "../test/configs/certs/ca.pem"`))
+	srvA, optsA := RunServerWithConfig(confA)
+	defer srvA.Shutdown()
+
+	optsB := testGatewayOptionsFromToWithTLS(t, "B", "A", []string{fmt.Sprintf("nats://127.0.0.1:%d", optsA.Gateway.Port)})
+	srvB := runGatewayServer(optsB)
+	defer srvB.Shutdown()
+
+	waitForInboundGateways(t, srvA, 1, time.Second)
+	waitForOutboundGateways(t, srvA, 1, time.Second)
+	waitForInboundGateways(t, srvB, 1, time.Second)
+	waitForOutboundGateways(t, srvB, 1, time.Second)
+
+	// We will verify that the config reload of the tls{} block is applied to
+	// the implicit remote (from A to B) by removing the ca_file.
+	reloadUpdateConfig(t, srvA, confA, fmt.Sprintf(template, ""))
+
+	// Get the remote from A to B
+	cfg := srvA.getRemoteGateway("B")
+	require_NotNil(t, cfg)
+	cfg.Lock()
+	tc := cfg.TLSConfig
+	cfg.Unlock()
+	require_NotNil(t, tc)
+	// The CA should have been removed.
+	require_True(t, tc.ClientCAs == nil)
+
+	// Reset the connection attempts, since we are going to close the connection
+	// from A to B and make sure that connection keeps failing.
+	cfg.resetConnAttempts()
+
+	// Get the outbound connection and close it.
+	c := srvA.getOutboundGatewayConnection("B")
+	require_NotNil(t, c)
+	c.mu.Lock()
+	c.nc.Close()
+	c.mu.Unlock()
+
+	// Verify that we fail to connect from A to B now.
+	waitForGatewayFailedConnect(t, srvA, "B", true, time.Second)
+}
+
 func TestGatewayAuthDiscovered(t *testing.T) {
 	SetGatewaysSolicitDelay(5 * time.Millisecond)
 	defer ResetGatewaysSolicitDelay()
@@ -7408,4 +7528,140 @@ func TestGatewayOutboundDetectsStaleConnectionIfNoInfo(t *testing.T) {
 	close(ch)
 	wg.Wait()
 	s.WaitForShutdown()
+}
+
+func TestGatewayConfigureWriteDeadline(t *testing.T) {
+	o1 := testDefaultOptionsForGateway("B")
+	o1.Gateway.WriteDeadline = 5 * time.Second
+	s1 := runGatewayServer(o1)
+	defer s1.Shutdown()
+
+	o2 := testGatewayOptionsFromToWithServers(t, "A", "B", s1)
+	s2 := runGatewayServer(o2)
+	defer s2.Shutdown()
+
+	waitForOutboundGateways(t, s2, 1, time.Second)
+	waitForInboundGateways(t, s1, 1, time.Second)
+	waitForOutboundGateways(t, s1, 1, time.Second)
+
+	s1.mu.RLock()
+	defer s1.mu.RUnlock()
+
+	s1.gateway.RLock()
+	defer s1.gateway.RUnlock()
+
+	for _, r := range s1.gateway.out {
+		r.mu.Lock()
+		wdl := r.out.wdl
+		r.mu.Unlock()
+		require_Equal(t, wdl, 5*time.Second)
+	}
+
+	for _, r := range s1.gateway.in {
+		r.mu.Lock()
+		wdl := r.out.wdl
+		r.mu.Unlock()
+		require_Equal(t, wdl, 5*time.Second)
+	}
+}
+
+func TestGatewayConfigureWriteTimeoutPolicy(t *testing.T) {
+	for name, policy := range map[string]WriteTimeoutPolicy{
+		"Default": WriteTimeoutPolicyDefault,
+		"Retry":   WriteTimeoutPolicyRetry,
+		"Close":   WriteTimeoutPolicyClose,
+	} {
+		t.Run(name, func(t *testing.T) {
+			o1 := testDefaultOptionsForGateway("B")
+			o1.Gateway.WriteTimeout = policy
+			s1 := runGatewayServer(o1)
+			defer s1.Shutdown()
+
+			o2 := testGatewayOptionsFromToWithServers(t, "A", "B", s1)
+			s2 := runGatewayServer(o2)
+			defer s2.Shutdown()
+
+			waitForOutboundGateways(t, s2, 1, time.Second)
+			waitForInboundGateways(t, s1, 1, time.Second)
+			waitForOutboundGateways(t, s1, 1, time.Second)
+
+			s1.mu.RLock()
+			defer s1.mu.RUnlock()
+
+			s1.gateway.RLock()
+			defer s1.gateway.RUnlock()
+
+			for _, r := range s1.gateway.out {
+				if policy == WriteTimeoutPolicyDefault {
+					require_Equal(t, r.out.wtp, WriteTimeoutPolicyRetry)
+				} else {
+					require_Equal(t, r.out.wtp, policy)
+				}
+			}
+
+			for _, r := range s1.gateway.in {
+				if policy == WriteTimeoutPolicyDefault {
+					require_Equal(t, r.out.wtp, WriteTimeoutPolicyRetry)
+				} else {
+					require_Equal(t, r.out.wtp, policy)
+				}
+			}
+		})
+	}
+}
+
+func TestGatewayProcessRSubNoBlockingAccountFetch(t *testing.T) {
+	createAccountPubKey := func() string {
+		kp, err := nkeys.CreateAccount()
+		require_NoError(t, err)
+		pubkey, err := kp.PublicKey()
+		require_NoError(t, err)
+		return pubkey
+	}
+	sysPub := createAccountPubKey()
+	accPub := createAccountPubKey()
+	dir := t.TempDir()
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		server_name: srv
+		operator: %s
+		system_account: %s
+		resolver: {
+			type: cache
+			dir: '%s'
+			timeout: "2s"
+		}
+		gateway: {
+			name: "clust-B"
+			listen: 127.0.0.1:-1
+		}
+       `, ojwt, sysPub, dir)))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// Set up a mock gateway client.
+	c := s.createInternalAccountClient()
+	c.mu.Lock()
+	c.gw = &gateway{}
+	c.gw.outsim = &sync.Map{}
+	c.nc = &net.IPConn{}
+	c.mu.Unlock()
+
+	// Receiving a R+ should not be blocking, since we're in the gateway's readLoop.
+	start := time.Now()
+	require_NoError(t, c.processGatewayRSub(fmt.Appendf(nil, "%s subj queue 0", accPub)))
+	c.mu.Lock()
+	subs := len(c.subs)
+	c.mu.Unlock()
+	require_Len(t, subs, 1)
+	require_LessThan(t, time.Since(start), 100*time.Millisecond)
+
+	// Receiving a R- should not be blocking, since we're in the gateway's readLoop.
+	start = time.Now()
+	require_NoError(t, c.processGatewayRUnsub(fmt.Appendf(nil, "%s subj queue", accPub)))
+	c.mu.Lock()
+	subs = len(c.subs)
+	c.mu.Unlock()
+	require_Len(t, subs, 0)
+	require_LessThan(t, time.Since(start), 100*time.Millisecond)
 }

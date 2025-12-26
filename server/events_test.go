@@ -1,4 +1,4 @@
-// Copyright 2018-2024 The NATS Authors
+// Copyright 2018-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -24,6 +24,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -581,10 +583,6 @@ func TestSystemAccountDisconnectBadLogin(t *testing.T) {
 	}
 	defer ncs.Close()
 
-	// We should never hear $G account events for bad logins.
-	sub, _ := ncs.SubscribeSync("$SYS.ACCOUNT.$G.*")
-	defer sub.Unsubscribe()
-
 	// Listen for auth error events though.
 	asub, _ := ncs.SubscribeSync("$SYS.SERVER.*.CLIENT.AUTH.ERR")
 	defer asub.Unsubscribe()
@@ -592,11 +590,6 @@ func TestSystemAccountDisconnectBadLogin(t *testing.T) {
 	ncs.Flush()
 
 	nats.Connect(url, nats.Name("TEST BAD LOGIN"))
-
-	// Should not hear these.
-	if _, err := sub.NextMsg(100 * time.Millisecond); err == nil {
-		t.Fatalf("Received a disconnect message from bad login, expected none")
-	}
 
 	m, err := asub.NextMsg(100 * time.Millisecond)
 	if err != nil {
@@ -1245,7 +1238,7 @@ func TestAccountReqMonitoring(t *testing.T) {
 	s.EnableJetStream(&JetStreamConfig{StoreDir: t.TempDir()})
 	unusedAcc, _ := createAccount(s)
 	acc, akp := createAccount(s)
-	acc.EnableJetStream(nil)
+	acc.EnableJetStream(nil, nil)
 	subsz := fmt.Sprintf(accDirectReqSubj, acc.Name, "SUBSZ")
 	connz := fmt.Sprintf(accDirectReqSubj, acc.Name, "CONNZ")
 	jsz := fmt.Sprintf(accDirectReqSubj, acc.Name, "JSZ")
@@ -1290,8 +1283,8 @@ func TestAccountReqMonitoring(t *testing.T) {
 	// query statz/conns for account
 	resp, err = ncSys.Request(statz(acc.Name), nil, time.Second)
 	require_NoError(t, err)
-	respContentAcc := []string{`"conns":1,`, `"total_conns":1`, `"slow_consumers":0`, `"sent":{"msgs":0,"bytes":0}`,
-		`"received":{"msgs":0,"bytes":0}`, `"num_subscriptions":`, fmt.Sprintf(`"acc":"%s"`, acc.Name)}
+	respContentAcc := []string{`"conns":1,`, `"total_conns":1`, `"slow_consumers":0`, `"sent":{"msgs":0,"bytes":0`,
+		`"received":{"msgs":0,"bytes":0`, `"num_subscriptions":`, fmt.Sprintf(`"acc":"%s"`, acc.Name)}
 	require_Contains(t, string(resp.Data), respContentAcc...)
 
 	rIb := ncSys.NewRespInbox()
@@ -1348,11 +1341,11 @@ func TestAccountReqMonitoring(t *testing.T) {
 
 	// Since we now have processed our own message, sent msgs will be at least 1.
 	payload := string(resp.Data)
-	respContentAcc = []string{`"conns":1,`, `"total_conns":1`, `"slow_consumers":0`, `"sent":{"msgs":1,"bytes":0}`, fmt.Sprintf(`"acc":"%s"`, acc.Name)}
+	respContentAcc = []string{`"conns":1,`, `"total_conns":1`, `"slow_consumers":0`, `"sent":{"msgs":1,"bytes":0`, fmt.Sprintf(`"acc":"%s"`, acc.Name)}
 	require_Contains(t, payload, respContentAcc...)
 
 	// Depending on timing, statz message could be accounted too.
-	receivedOK := strings.Contains(payload, `"received":{"msgs":1,"bytes":0}`) || strings.Contains(payload, `"received":{"msgs":2,"bytes":0}`)
+	receivedOK := strings.Contains(payload, `"received":{"msgs":1,"bytes":0`) || strings.Contains(payload, `"received":{"msgs":2,"bytes":0`)
 	require_True(t, receivedOK)
 	_, err = rSub.NextMsg(200 * time.Millisecond)
 	require_Error(t, err)
@@ -1601,19 +1594,17 @@ func TestAccountConnsLimitExceededAfterUpdateDisconnectNewOnly(t *testing.T) {
 	// Now create the max connections.
 	// We create half then we will wait and then create the rest.
 	// Will test that we disconnect the newest ones.
-	newConns := make([]*nats.Conn, 0, 5)
 	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
 	for i := 0; i < 5; i++ {
-		nc, err := nats.Connect(url, nats.NoReconnect(), createUserCreds(t, s, akp))
+		nc, err := nats.Connect(url, nats.Name("OLD"), nats.NoReconnect(), createUserCreds(t, s, akp))
 		require_NoError(t, err)
 		defer nc.Close()
 	}
 	time.Sleep(500 * time.Millisecond)
 	for i := 0; i < 5; i++ {
-		nc, err := nats.Connect(url, nats.NoReconnect(), createUserCreds(t, s, akp))
+		nc, err := nats.Connect(url, nats.Name("NEW"), nats.NoReconnect(), createUserCreds(t, s, akp))
 		require_NoError(t, err)
 		defer nc.Close()
-		newConns = append(newConns, nc)
 	}
 
 	// We should have max here.
@@ -1631,15 +1622,12 @@ func TestAccountConnsLimitExceededAfterUpdateDisconnectNewOnly(t *testing.T) {
 	// We should have closed the excess connections.
 	checkClientsCount(t, s, acc.MaxActiveConnections())
 
-	// Now make sure that only the new ones were closed.
-	var closed int
-	for _, nc := range newConns {
-		if !nc.IsClosed() {
-			closed++
-		}
-	}
-	if closed != 5 {
-		t.Fatalf("Expected all new clients to be closed, only got %d of 5", closed)
+	connz, err := s.Connz(nil)
+	require_NoError(t, err)
+
+	// There should only be OLD connections.
+	for _, c := range connz.Conns {
+		require_Equal(t, c.Name, "OLD")
 	}
 }
 
@@ -1675,7 +1663,7 @@ func TestSystemAccountWithGateways(t *testing.T) {
 
 	// If this tests fails with wrong number after 10 seconds we may have
 	// added a new initial subscription for the eventing system.
-	checkExpectedSubs(t, 58, sa)
+	checkExpectedSubs(t, 62, sa)
 
 	// Create a client on B and see if we receive the event
 	urlb := fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port)
@@ -1963,6 +1951,8 @@ func TestServerEventsStatsZ(t *testing.T) {
 			t.Fatalf("Expected server A's route to B to have Name set to %q, got %q", "B", sr.Name)
 		}
 	}
+	// Increment stalls to confirm they are reported.
+	atomic.AddInt64(&sb.stalls, 3)
 
 	// Now query B and check that route's name is "A"
 	subj = fmt.Sprintf(serverStatsReqSubj, sb.ID())
@@ -1983,6 +1973,7 @@ func TestServerEventsStatsZ(t *testing.T) {
 			t.Fatalf("Expected server B's route to A to have Name set to %q, got %q", "A_SRV", sr.Name)
 		}
 	}
+	require_Equal(t, m.Stats.StalledClients, 3)
 }
 
 func TestServerEventsHealthZSingleServer(t *testing.T) {
@@ -2059,6 +2050,15 @@ func TestServerEventsHealthZSingleServer(t *testing.T) {
 			req: &HealthzEventOptions{
 				HealthzOptions: HealthzOptions{
 					JSServerOnly: true,
+				},
+			},
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
+			name: "with js meta only",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					JSMetaOnly: true,
 				},
 			},
 			expected: HealthStatus{Status: "ok", StatusCode: 200},
@@ -2332,6 +2332,10 @@ func TestServerEventsHealthZClustered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error creating consumer: %v", err)
 	}
+
+	c.waitOnStreamLeader("ONE", "test")
+	c.waitOnConsumerLeader("ONE", "test", "cons")
+	c.waitOnAllCurrent()
 
 	subj := fmt.Sprintf(serverHealthzReqSubj, c.servers[0].ID())
 	pingSubj := fmt.Sprintf(serverHealthzReqSubj, "PING")
@@ -3046,6 +3050,7 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 		{"HEALTHZ", nil, &JSzOptions{}, []string{"status"}},
 		{"HEALTHZ", &HealthzOptions{JSEnabledOnly: true}, &JSzOptions{}, []string{"status"}},
 		{"HEALTHZ", &HealthzOptions{JSServerOnly: true}, &JSzOptions{}, []string{"status"}},
+		{"HEALTHZ", &HealthzOptions{JSMetaOnly: true}, &JSzOptions{}, []string{"status"}},
 		{"EXPVARZ", nil, &ExpvarzStatus{}, []string{"memstats", "cmdline"}},
 	}
 
@@ -3346,6 +3351,86 @@ func TestServerEventsFilteredByTag(t *testing.T) {
 	require_Len(t, len(msgs), 0)
 }
 
+func TestServerUnstableEventFilterMatch(t *testing.T) {
+	confA := createConfFile(t, []byte(`
+		listen: -1
+		server_name: srv1
+		server_tags: ["foo", "bar"]
+		cluster {
+			name: clust
+			listen: -1
+			no_advertise: true
+		}
+		system_account: SYS
+		accounts: {
+			SYS: {
+				users: [
+					{user: b, password: b}
+				]
+			}
+		}
+		no_auth_user: b
+    `))
+	sA, _ := RunServerWithConfig(confA)
+	defer sA.Shutdown()
+	confB := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: -1
+		server_name: srv10
+		server_tags: ["bar", "baz"]
+		cluster {
+			name: clust
+			listen: -1
+			no_advertise: true
+			routes [
+				nats-route://127.0.0.1:%d
+			]
+		}
+		system_account: SYS
+		accounts: {
+			SYS: {
+				users: [
+					{user: b, password: b}
+				]
+			}
+		}
+		no_auth_user: b
+    `, sA.opts.Cluster.Port)))
+	sB, _ := RunServerWithConfig(confB)
+	defer sB.Shutdown()
+	checkClusterFormed(t, sA, sB)
+
+	tester := func(t *testing.T, nc *nats.Conn, name string, count int) {
+		t.Helper()
+
+		r, err := json.Marshal(VarzEventOptions{EventFilterOptions: EventFilterOptions{Name: name, ExactMatch: true}})
+		require_NoError(t, err)
+
+		for i := 0; i < count; i++ {
+			res, err := nc.Request(fmt.Sprintf(serverPingReqSubj, "VARZ"), r, time.Second)
+			require_NoError(t, err)
+
+			var vz ServerAPIVarzResponse
+			err = json.Unmarshal(res.Data, &vz)
+			require_NoError(t, err)
+
+			if vz.Server.Name != name {
+				t.Fatalf("Expected server name to be %q, got %q", name, vz.Server.Name)
+			}
+		}
+	}
+
+	// Connects to srv1 so it's most likely to respond first while we are asking srv10 to respond.
+	nc := natsConnect(t, sA.ClientURL())
+	defer nc.Close()
+	tester(t, nc, "srv10", 10)
+
+	// Connects to srv10 so it's most likely to respond first while we are asking srv1 to respond.
+	nc.Close()
+	nc = natsConnect(t, sB.ClientURL())
+	defer nc.Close()
+	tester(t, nc, "srv1", 10)
+}
+
 // https://github.com/nats-io/nats-server/issues/3177
 func TestServerEventsAndDQSubscribers(t *testing.T) {
 	c := createJetStreamClusterWithTemplate(t, jsClusterAccountsTempl, "DDQ", 3)
@@ -3605,14 +3690,17 @@ func TestClusterSetupMsgs(t *testing.T) {
 	c := createClusterEx(t, false, 0, false, "cluster", numServers)
 	defer shutdownCluster(c)
 
-	var totalOut int
-	for _, server := range c.servers {
-		totalOut += int(atomic.LoadInt64(&server.outMsgs))
-	}
-	totalExpected := numServers * numServers
-	if totalOut >= totalExpected {
-		t.Fatalf("Total outMsgs is %d, expected < %d\n", totalOut, totalExpected)
-	}
+	checkFor(t, 3*time.Second, 500*time.Millisecond, func() error {
+		var totalOut int
+		for _, server := range c.servers {
+			totalOut += int(atomic.LoadInt64(&server.outMsgs))
+		}
+		totalExpected := numServers * numServers
+		if totalOut >= totalExpected {
+			return fmt.Errorf("Total outMsgs is %d, expected < %d\n", totalOut, totalExpected)
+		}
+		return nil
+	})
 }
 
 func TestServerEventsProfileZNotBlockingRecvQ(t *testing.T) {
@@ -3674,4 +3762,318 @@ func TestServerEventsProfileZNotBlockingRecvQ(t *testing.T) {
 			testReq(t, test.f())
 		})
 	}
+}
+
+func TestServerEventsStatsZJetStreamApiLevel(t *testing.T) {
+	s, opts := runTrustedServer(t)
+	defer s.Shutdown()
+
+	acc, akp := createAccount(s)
+	s.setSystemAccount(acc)
+	s.EnableJetStream(&JetStreamConfig{StoreDir: t.TempDir()})
+
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	ncs, err := nats.Connect(url, createUserCreds(t, s, akp))
+	require_NoError(t, err)
+	defer ncs.Close()
+
+	msg, err := ncs.Request("$SYS.REQ.SERVER.PING.STATSZ", nil, time.Second)
+	require_NoError(t, err)
+
+	var stats ServerStatsMsg
+	err = json.Unmarshal(msg.Data, &stats)
+	require_NoError(t, err)
+
+	require_Equal(t, stats.Stats.JetStream.Stats.API.Level, JSApiLevel)
+}
+
+func TestServerEventsPingStatsSlowConsumersStats(t *testing.T) {
+	s, _ := runTrustedServer(t)
+	defer s.Shutdown()
+
+	acc, akp := createAccount(s)
+	s.setSystemAccount(acc)
+	ncs, err := nats.Connect(s.ClientURL(), createUserCreds(t, s, akp))
+	require_NoError(t, err)
+	defer ncs.Close()
+
+	const statsz = "STATSZ"
+	for _, test := range []struct {
+		name      string
+		f         func() string
+		expectTwo bool
+	}{
+		{"server stats ping request subject", func() string { return serverStatsPingReqSubj }, true},
+		{"server ping request subject", func() string { return fmt.Sprintf(serverPingReqSubj, statsz) }, true},
+		{"server direct request subject", func() string { return fmt.Sprintf(serverDirectReqSubj, s.ID(), statsz) }, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Clear all slow consumers values
+			s.scStats.clients.Store(0)
+			s.scStats.routes.Store(0)
+			s.scStats.gateways.Store(0)
+			s.scStats.leafs.Store(0)
+
+			msg, err := ncs.Request(test.f(), nil, time.Second)
+			require_NoError(t, err)
+
+			var ssm ServerStatsMsg
+			err = json.Unmarshal(msg.Data, &ssm)
+			require_NoError(t, err)
+
+			// No slow consumer stats, so should be nil
+			require_True(t, ssm.Stats.SlowConsumersStats == nil)
+
+			// Now set some values
+			s.scStats.clients.Store(1)
+			s.scStats.routes.Store(2)
+			s.scStats.gateways.Store(3)
+			s.scStats.leafs.Store(4)
+
+			msg, err = ncs.Request(test.f(), nil, time.Second)
+			require_NoError(t, err)
+
+			ssm = ServerStatsMsg{}
+			err = json.Unmarshal(msg.Data, &ssm)
+			require_NoError(t, err)
+
+			require_NotNil(t, ssm.Stats.SlowConsumersStats)
+			scs := ssm.Stats.SlowConsumersStats
+			require_Equal(t, scs.Clients, 1)
+			require_Equal(t, scs.Routes, 2)
+			require_Equal(t, scs.Gateways, 3)
+			require_Equal(t, scs.Leafs, 4)
+		})
+	}
+}
+
+func TestServerEventsPingStatsStaleConnectionStats(t *testing.T) {
+	templ := `
+                        listen: "127.0.0.1:-1"
+                        system_account = sys
+                        accounts {
+                          a {
+                            users = [{ user: a,  pass: a  }]
+                          }
+                          b {
+                            users = [{ user: b,  pass: b  }]
+                          }
+                          sys {
+                            users = [{ user: sys, pass: sys }]
+                          }
+                        }
+                        `
+	conf := createConfFile(t, []byte(templ))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// 3 different ways to get statz:
+	const statsz = "STATSZ"
+
+	// $SYS.REQ.SERVER.NCBT6MBA7Q7ZF4R4WVXTSZTCZDPPXX2ALLN3XM75VCBCNMPIKQFPFLKV.STATSZ
+	dirReqSubject := func(s *Server) string {
+		return fmt.Sprintf(serverDirectReqSubj, s.ID(), statsz)
+	}
+	// $SYS.REQ.SERVER.PING.STATSZ
+	pingReqSubject := func(s *Server) string {
+		return fmt.Sprintf(serverPingReqSubj, statsz)
+	}
+	// $SYS.REQ.SERVER.PING
+	statsPingSubject := func(s *Server) string {
+		return serverStatsPingReqSubj
+	}
+	subjects := []string{dirReqSubject(s), pingReqSubject(s), statsPingSubject(s)}
+
+	ncs, err := nats.Connect(s.ClientURL(), nats.UserInfo("sys", "sys"))
+	require_NoError(t, err)
+
+	for _, subject := range subjects {
+		msg, err := ncs.Request(subject, nil, time.Second)
+		require_NoError(t, err)
+
+		var ssm ServerStatsMsg
+		err = json.Unmarshal(msg.Data, &ssm)
+		require_NoError(t, err)
+
+		// No stale connection stats.
+		require_True(t, ssm.Stats.StaleConnectionStats == nil)
+		require_Equal(t, s.NumStaleConnections(), int64(0))
+		require_Equal(t, s.NumStaleConnectionsClients(), uint64(0))
+		require_Equal(t, s.NumStaleConnectionsRoutes(), uint64(0))
+		require_Equal(t, s.NumStaleConnectionsGateways(), uint64(0))
+		require_Equal(t, s.NumStaleConnectionsLeafs(), uint64(0))
+	}
+
+	// Set some values and confirm.
+	s.staleStats.clients.Store(1)
+	s.staleStats.routes.Store(2)
+	s.staleStats.gateways.Store(3)
+	s.staleStats.leafs.Store(4)
+	atomic.StoreInt64(&s.staleConnections, 10)
+	require_Equal(t, s.NumStaleConnections(), int64(10))
+	require_Equal(t, s.NumStaleConnectionsClients(), uint64(1))
+	require_Equal(t, s.NumStaleConnectionsRoutes(), uint64(2))
+	require_Equal(t, s.NumStaleConnectionsGateways(), uint64(3))
+	require_Equal(t, s.NumStaleConnectionsLeafs(), uint64(4))
+
+	for _, subject := range subjects {
+		msg, err := ncs.Request(subject, nil, time.Second)
+		require_NoError(t, err)
+
+		ssm := ServerStatsMsg{}
+		err = json.Unmarshal(msg.Data, &ssm)
+		require_NoError(t, err)
+
+		require_NotNil(t, ssm.Stats.StaleConnectionStats)
+		stcs := ssm.Stats.StaleConnectionStats
+		require_Equal(t, stcs.Clients, 1)
+		require_Equal(t, stcs.Routes, 2)
+		require_Equal(t, stcs.Gateways, 3)
+		require_Equal(t, stcs.Leafs, 4)
+		require_Equal(t, ssm.Stats.StaleConnections, int64(10))
+	}
+}
+
+func TestServerEventsStatszMaxProcsMemLimit(t *testing.T) {
+	// We want to prove that our set values are reflected in STATSZ,
+	// so we can't use constants that might match the system that
+	// the test is run on.
+	omp, omm := runtime.GOMAXPROCS(-1), debug.SetMemoryLimit(-1)
+	mp, mm := runtime.GOMAXPROCS(omp*2)*2, debug.SetMemoryLimit(omm/2)/2
+
+	// When we're done, put everything back.
+	defer runtime.GOMAXPROCS(omp)
+	defer debug.SetMemoryLimit(omm)
+
+	s, opts := runTrustedServer(t)
+	defer s.Shutdown()
+
+	acc, akp := createAccount(s)
+	s.setSystemAccount(acc)
+
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	ncs, err := nats.Connect(url, createUserCreds(t, s, akp))
+	require_NoError(t, err)
+	defer ncs.Close()
+
+	msg, err := ncs.Request("$SYS.REQ.SERVER.PING.STATSZ", nil, time.Second)
+	require_NoError(t, err)
+
+	var stats ServerStatsMsg
+	require_NoError(t, json.Unmarshal(msg.Data, &stats))
+	require_Equal(t, stats.Stats.MaxProcs, mp)
+	require_Equal(t, stats.Stats.MemLimit, mm)
+}
+
+func TestSubszPagination(t *testing.T) {
+	type subszResp struct {
+		Subsz  Subsz      `json:"data"`
+		Server ServerInfo `json:"server"`
+	}
+	s, opts := runTrustedServer(t)
+	defer s.Shutdown()
+
+	sysAcc, sysAkp := createAccount(s)
+	s.setSystemAccount(sysAcc)
+
+	acc, akp := createAccount(s)
+
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	ncSys, err := nats.Connect(url, createUserCreds(t, s, sysAkp))
+	require_NoError(t, err)
+	defer ncSys.Close()
+
+	nc, err := nats.Connect(url, createUserCreds(t, s, akp))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	// Create 100 subscriptions.
+	for i := range 100 {
+		nc.Subscribe(fmt.Sprintf("foo.%d", i), func(_ *nats.Msg) {})
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	reqSubject := fmt.Sprintf(accDirectReqSubj, acc.Name, "SUBSZ")
+
+	// Request the first page.
+	subszReq := SubszOptions{Subscriptions: true, Limit: 10}
+	req, _ := json.Marshal(subszReq)
+	msg, err := ncSys.Request(reqSubject, req, time.Second)
+	require_NoError(t, err)
+
+	var subsz subszResp
+	require_NoError(t, json.Unmarshal(msg.Data, &subsz))
+	require_Equal(t, len(subsz.Subsz.Subs), 10)
+
+	// we cannot check for equality since we have to account for the monitoring subscriptions
+	if subsz.Subsz.Total < 100 || subsz.Subsz.Total > 110 {
+		t.Fatalf("Expected total subscriptions to be more than 100 and less than 110, got %d", subsz.Subsz.Total)
+	}
+
+	// Now test with a sub filter
+
+	// create 10 subs on "bar.*"
+	for range 10 {
+		nc.Subscribe("bar.*", func(_ *nats.Msg) {})
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	subszReq = SubszOptions{Subscriptions: true, Limit: 5, Test: "bar.A"}
+	req, _ = json.Marshal(subszReq)
+	msg, err = ncSys.Request(reqSubject, req, time.Second)
+	require_NoError(t, err)
+
+	var subszFiltered subszResp
+	require_NoError(t, json.Unmarshal(msg.Data, &subszFiltered))
+	require_Equal(t, len(subszFiltered.Subsz.Subs), 5)
+	require_Equal(t, subszFiltered.Subsz.Total, 10)
+}
+
+func TestServerEventsConnectDisconnectForGlobalAcc(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		accounts {
+			$SYS {
+				users [{user: "admin", password: "pwd"}]
+			}
+		}
+	`))
+	defer os.Remove(conf)
+
+	s, opts := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	ncs, err := nats.Connect(url, nats.UserInfo("admin", "pwd"))
+	require_NoError(t, err)
+	defer ncs.Close()
+
+	s1, err := ncs.SubscribeSync(fmt.Sprintf(connectEventSubj, globalAccountName))
+	require_NoError(t, err)
+	s2, err := ncs.SubscribeSync(fmt.Sprintf(disconnectEventSubj, globalAccountName))
+	require_NoError(t, err)
+
+	// Flush to make sure subscriptions are established
+	require_NoError(t, ncs.Flush())
+
+	// Connect to global account
+	ncg, err := nats.Connect(url, nats.UserInfo("", ""))
+	require_NoError(t, err)
+
+	// System account should get a connect event
+	msg, err := s1.NextMsg(5 * time.Second)
+	require_NoError(t, err)
+	require_Equal(t, msg.Subject, fmt.Sprintf(connectEventSubj, globalAccountName))
+
+	// Disconnect from global account
+	ncg.Close()
+
+	// System account should get a disconnect event
+	msg, err = s2.NextMsg(5 * time.Second)
+	require_NoError(t, err)
+	require_Equal(t, msg.Subject, fmt.Sprintf(disconnectEventSubj, globalAccountName))
 }

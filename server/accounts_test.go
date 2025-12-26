@@ -1,4 +1,4 @@
-// Copyright 2018-2023 The NATS Authors
+// Copyright 2018-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1546,7 +1547,7 @@ func TestServiceImportWithWildcards(t *testing.T) {
 	checkPayload(crBar, []byte("22\r\n"), t)
 
 	// Remove the service import with the wildcard and make sure hasWC is cleared.
-	barAcc.removeServiceImport("test.*")
+	barAcc.removeServiceImport(fooAcc.Name, "test.*")
 
 	barAcc.mu.Lock()
 	defer barAcc.mu.Unlock()
@@ -2423,6 +2424,167 @@ func TestAccountDuplicateServiceImportSubject(t *testing.T) {
 	if err := barAcc.AddServiceImport(fooAcc, "foo", "remote2"); err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("Expected an error about duplicate service import subject, got %q", err)
 	}
+
+	// However, it is allowed to add more than one service import
+	// on the same subject for different exporting accounts
+	bazAcc, _ := s.RegisterAccount("baz")
+	bazAcc.AddServiceExport("remote1", nil)
+	if err := barAcc.AddServiceImport(bazAcc, "foo", "remote1"); err != nil {
+		t.Fatalf("Error adding service import: %v", err)
+	}
+	batAcc, _ := s.RegisterAccount("bat")
+	batAcc.AddServiceExport("remote1", nil)
+	if err := barAcc.AddServiceImport(batAcc, "foo", "remote1"); err != nil {
+		t.Fatalf("Error adding service import: %v", err)
+	}
+
+	// But again, can't add for one that has been already added, say bazAcc.
+	if err := barAcc.AddServiceImport(bazAcc, "foo", "remote1"); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("Expected an error about duplicate service import subject, got %q", err)
+	}
+}
+
+func TestAccountRemoveServiceImport(t *testing.T) {
+	opts := DefaultOptions()
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	fooAcc, _ := s.RegisterAccount("foo")
+	fooAcc.AddServiceExport("remote1", nil)
+
+	barAcc, _ := s.RegisterAccount("bar")
+	err := barAcc.AddServiceImport(fooAcc, "foo", "remote1")
+	require_NoError(t, err)
+
+	bazAcc, _ := s.RegisterAccount("baz")
+	bazAcc.AddServiceExport("remote1", nil)
+	err = barAcc.AddServiceImport(bazAcc, "foo", "remote1")
+	require_NoError(t, err)
+
+	batAcc, _ := s.RegisterAccount("bat")
+	batAcc.AddServiceExport("remote1", nil)
+	err = barAcc.AddServiceImport(batAcc, "foo", "remote1")
+	require_NoError(t, err)
+
+	// Check that we can get the service import we expect
+	checkGetSI := func(acc, subj string) bool {
+		barAcc.mu.RLock()
+		defer barAcc.mu.RUnlock()
+		si := barAcc.getServiceImportForAccountLocked(acc, subj)
+		if si == nil {
+			return false
+		}
+		return si.acc.Name == acc
+	}
+	require_False(t, checkGetSI("nonsense", "foo"))
+	require_False(t, checkGetSI("foo", "nonsense"))
+	require_True(t, checkGetSI("foo", "foo"))
+	require_True(t, checkGetSI("baz", "foo"))
+	require_True(t, checkGetSI("bat", "foo"))
+
+	// Remove service imports one by one and check expected map content.
+
+	// Try first to remove one that does not exists, because of subject
+	// or because of account.
+	barAcc.removeServiceImport("nonsense", "foo")
+	require_True(t, checkGetSI("foo", "foo"))
+	require_True(t, checkGetSI("baz", "foo"))
+	require_True(t, checkGetSI("bat", "foo"))
+	barAcc.removeServiceImport("baz", "nonsense")
+	require_True(t, checkGetSI("foo", "foo"))
+	require_True(t, checkGetSI("baz", "foo"))
+	require_True(t, checkGetSI("bat", "foo"))
+
+	// Remove the 2nd account that was added
+	barAcc.removeServiceImport("baz", "foo")
+	require_False(t, checkGetSI("baz", "foo"))
+	require_True(t, checkGetSI("foo", "foo"))
+	require_True(t, checkGetSI("bat", "foo"))
+
+	// Remove the last account that was added
+	barAcc.removeServiceImport("bat", "foo")
+	require_False(t, checkGetSI("baz", "foo"))
+	require_False(t, checkGetSI("bat", "foo"))
+	require_True(t, checkGetSI("foo", "foo"))
+
+	// There is only one left, make sure that we still properly check
+	// for appropriate subject and account name.
+	barAcc.removeServiceImport("nonsense", "foo")
+	require_False(t, checkGetSI("baz", "foo"))
+	require_False(t, checkGetSI("bat", "foo"))
+	require_True(t, checkGetSI("foo", "foo"))
+	barAcc.removeServiceImport("foo", "nonsense")
+	require_False(t, checkGetSI("baz", "foo"))
+	require_False(t, checkGetSI("bat", "foo"))
+	require_True(t, checkGetSI("foo", "foo"))
+
+	// Remove the first account that was added
+	barAcc.removeServiceImport("foo", "foo")
+	require_False(t, checkGetSI("baz", "foo"))
+	require_False(t, checkGetSI("bat", "foo"))
+	require_False(t, checkGetSI("foo", "foo"))
+
+	// Make sure that the service import map is cleared
+	barAcc.mu.RLock()
+	sis, ok := barAcc.imports.services["foo"]
+	barAcc.mu.RUnlock()
+	require_False(t, ok)
+	require_Len(t, len(sis), 0)
+}
+
+func TestAccountMultipleServiceImportsWithSameSubjectFromDifferentAccounts(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		accounts: {
+			SVC-E: {
+				users: [ { user:svc-e, password:svc-e } ]
+				exports: [ { accounts: [CLIENTS], service: "SvcReq.>", response_type: singleton } ]
+			}
+
+			SVC-W: {
+				users: [ { user:svc-w, password:svc-w } ]
+				exports: [ { accounts: [CLIENTS], service: "SvcReq.>", response_type: singleton } ]
+			}
+
+			CLIENTS: {
+				users: [ { user:cl, password:cl } ]
+				imports: [
+					{ service: { account: SVC-E, subject: "SvcReq.>" } }
+					{ service: { account: SVC-W, subject: "SvcReq.>" } }
+				]
+			}
+		}
+		listen: "127.0.0.1:-1"
+	`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	ncE := natsConnect(t, s.ClientURL(), nats.UserInfo("svc-e", "svc-e"))
+	defer ncE.Close()
+	natsSub(t, ncE, "SvcReq.>", func(m *nats.Msg) {
+		m.Respond([]byte("From SVC-E"))
+	})
+	natsFlush(t, ncE)
+
+	ncW := natsConnect(t, s.ClientURL(), nats.UserInfo("svc-w", "svc-w"))
+	defer ncW.Close()
+	natsSub(t, ncW, "SvcReq.>", func(m *nats.Msg) {
+		m.Respond([]byte("From SVC-W"))
+	})
+	natsFlush(t, ncW)
+
+	nc := natsConnect(t, s.ClientURL(), nats.UserInfo("cl", "cl"))
+	defer nc.Close()
+	sub := natsSubSync(t, nc, nats.NewInbox())
+	natsPubReq(t, nc, "SvcReq.Test", sub.Subject, []byte("test"))
+	msg1 := natsNexMsg(t, sub, time.Second)
+	msg2 := natsNexMsg(t, sub, time.Second)
+	m1 := string(msg1.Data)
+	m2 := string(msg2.Data)
+	if (m1 == "From SVC-E" && m2 == "From SVC-W") || (m1 == "From SVC-W" && m2 == "From SVC-E") {
+		// Ok
+		return
+	}
+	t.Fatalf("Unexpected responses: m1=%s m2=%s", m1, m2)
 }
 
 func TestMultipleStreamImportsWithSameSubjectDifferentPrefix(t *testing.T) {
@@ -3375,6 +3537,227 @@ func TestAccountLimitsServerConfig(t *testing.T) {
 	require_Error(t, err)
 }
 
+// Connections being closed should be the newer ones in case of JWT limits.
+func TestAccountMaxConnectionsDisconnectsNewestFirst(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+        port: -1
+        server_name: A
+        accounts {
+                TEST {
+                        users = [
+                          {user: user1, password: foo}
+                          {user: user2, password: foo}
+                          {user: user3, password: foo}
+                        ]
+                        limits {
+                                max_connections: 3
+                        }
+                }
+        }
+        `))
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	var conns []*nats.Conn
+
+	disconnects := make([]chan error, 0)
+	for i := 1; i <= 3; i++ {
+		disconnectCh := make(chan error)
+		c, err := nats.Connect(
+			s.ClientURL(),
+			nats.UserInfo(fmt.Sprintf("user%d", i), "foo"),
+			nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+				disconnectCh <- err
+			}),
+			nats.NoReconnect(),
+		)
+		require_NoError(t, err)
+		defer c.Close()
+		conns = append(conns, c)
+		disconnects = append(disconnects, disconnectCh)
+		// Small delay to ensure distinct start times.
+		time.Sleep(10 * time.Millisecond)
+	}
+	acc, err := s.lookupAccount("TEST")
+	require_NoError(t, err)
+	require_Equal(t, acc.NumConnections(), 3)
+
+	// Force account update to trigger connection limit enforcement.
+	accClaims := jwt.NewAccountClaims(acc.Name)
+	accClaims.Limits.Conn = 2
+	s.UpdateAccountClaims(acc, accClaims)
+
+	// Wait for disconnections from the most recent client.
+	disconnectCh := disconnects[2]
+	select {
+	case <-disconnectCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Expected newest connection to disconnect!")
+	}
+
+	// Check which connections are still active
+	// The newest connection (last one created) should be disconnected first.
+	activeConnections := 0
+	var connected []int
+	for i, conn := range conns {
+		if !conn.IsClosed() {
+			activeConnections++
+			connected = append(connected, i)
+		}
+	}
+	require_Equal(t, activeConnections, 2)
+	require_Equal(t, len(connected), 2)
+
+	// The first two connections should still be connected.
+	require_Equal(t, connected[0], 0)
+	require_Equal(t, connected[1], 1)
+
+	// The newest connection should be closed.
+	require_True(t, conns[2].IsClosed())
+}
+
+func TestAccountUpdateRemoteServerDisconnectsNewestFirst(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+          port: -1
+          accounts {
+            TEST {
+              users = [{user: dummy, password: foo}]
+              limits {
+                max_connections: 5
+              }
+            }
+          }
+        `))
+
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	acc, err := s.lookupAccount("TEST")
+	require_NoError(t, err)
+
+	for i := 0; i < 3; i++ {
+		c, err := nats.Connect(s.ClientURL(), nats.UserInfo("dummy", "foo"))
+		require_NoError(t, err)
+		defer c.Close()
+
+		// Small delay to ensure distinct start times.
+		time.Sleep(10 * time.Millisecond)
+	}
+	require_Equal(t, acc.NumConnections(), 3)
+
+	// Simulate remote server reporting connections that would exceed the limit.
+	// Remote has 4 + we have 3, meaning that 2 will have to be disconnected.
+	remoteServerMsg := &AccountNumConns{
+		Server: ServerInfo{
+			ID:   "fake-server-1",
+			Name: "fake-nats-1",
+		},
+		AccountStat: AccountStat{
+			Account: "TEST",
+			Conns:   4,
+		},
+	}
+	toDisconnect := acc.updateRemoteServer(remoteServerMsg)
+
+	// Should want to disconnect 2 clients (7 total - 5 max conns limit = 2 over).
+	require_Equal(t, len(toDisconnect), 2)
+
+	// Verify the returned clients are in reverse chronological order.
+	var startTimes []time.Time
+	for _, c := range toDisconnect {
+		startTimes = append(startTimes, c.start)
+	}
+	if !startTimes[0].After(startTimes[1]) {
+		t.Fatalf("Expected clients to be in reverse chronological order: %v is before %v", startTimes[0], startTimes[1])
+	}
+
+	// The clients to disconnect should be the newest ones we created.
+	disconnected := make(map[uint64]bool)
+	for _, c := range toDisconnect {
+		disconnected[c.cid] = true
+	}
+
+	// Get all current clients and find the oldest ones.
+	allClients := acc.getClients()
+	byStartTime := make([]*client, len(allClients))
+	copy(byStartTime, allClients)
+	slices.SortFunc(byStartTime, func(i, j *client) int {
+		return i.start.Compare(j.start)
+	})
+
+	// The last two clients in the sorted list should be the ones selected for disconnection.
+	require_False(t, disconnected[byStartTime[0].cid])
+	require_True(t, disconnected[byStartTime[1].cid])
+	require_True(t, disconnected[byStartTime[2].cid])
+}
+
+func TestAccountMaxConnectionsDuringLameDuckMode(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+        port: -1
+        accounts {
+                TEST {
+                        users = [
+                          {user: user, password: user}
+                        ]
+                        limits {
+                                max_connections: 3
+                        }
+                }
+        }
+		cluster {
+		  listen: 127.0.0.1:7248
+		  name: "abc"
+		}
+		no_auth_user: user
+		lame_duck_grace_period: 1s
+        `))
+
+	optsA, err := ProcessConfigFile(cf)
+	require_NoError(t, err)
+	optsA.NoSigs, optsA.NoLog = true, true
+	optsA.ServerName = "A"
+	srvA := RunServer(optsA)
+	defer srvA.Shutdown()
+	optsB := nextServerOpts(optsA)
+	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://%s:%d", optsA.Cluster.Host, optsA.Cluster.Port))
+	optsB.ServerName = "B"
+	srvB := RunServer(optsB)
+	defer srvB.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB)
+
+	disconnects := make([]chan error, 0)
+	for range 3 {
+		disconnectCh := make(chan error)
+		c, err := nats.Connect(
+			srvA.ClientURL(),
+			nats.UserInfo("user", "user"),
+			nats.DisconnectErrHandler(func(c *nats.Conn, err error) {
+				disconnectCh <- err
+			}),
+		)
+		require_NoError(t, err)
+		defer c.Close()
+		disconnects = append(disconnects, disconnectCh)
+		// Small delay to ensure distinct start times.
+		time.Sleep(10 * time.Millisecond)
+	}
+	acc, err := srvA.lookupAccount("TEST")
+	require_NoError(t, err)
+	require_Equal(t, acc.NumConnections(), 3)
+
+	go srvA.LameDuckShutdown()
+
+	for _, disconnectCh := range disconnects {
+		select {
+		case err := <-disconnectCh:
+			require_Equal(t, err.Error(), "EOF")
+		case <-time.After(5 * time.Second):
+			t.Fatal("Expected LDM reconnect")
+		}
+	}
+}
+
 func TestAccountUserSubPermsWithQueueGroups(t *testing.T) {
 	cf := createConfFile(t, []byte(`
 	listen: 127.0.0.1:-1
@@ -3600,6 +3983,8 @@ func TestAccountReloadServiceImportPanic(t *testing.T) {
 
 	_, err := nc.Subscribe("HELP", func(m *nats.Msg) { m.Respond([]byte("OK")) })
 	require_NoError(t, err)
+	// Make sure the subscription is processed before using a new connection to publish.
+	natsFlush(t, nc)
 
 	// Now create connection to account b where we will publish to HELP.
 	nc, _ = jsClientConnect(t, s, nats.UserInfo("b", "p"))
@@ -3687,4 +4072,32 @@ func TestAccountServiceAndStreamExportDoubleDelivery(t *testing.T) {
 	nc.Publish("DW.test.123", []byte("test"))
 	time.Sleep(200 * time.Millisecond)
 	require_Equal(t, msgs.Load(), 1)
+}
+
+func TestAccountServiceImportNoResponders(t *testing.T) {
+	// Setup NATS server.
+	cf := createConfFile(t, []byte(`
+				port: -1
+				accounts: {
+					accExp: {
+						users: [{user: accExp, password: accExp}]
+						exports: [{service: "foo"}]
+					}
+					accImp: {
+						users: [{user: accImp, password: accImp}]
+						imports: [{service: {account: accExp, subject: "foo"}}]
+					}
+				}
+			`))
+
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	// Connect to the import account. We will not setup any responders, so a request should
+	// error out with ErrNoResponders.
+	nc := natsConnect(t, s.ClientURL(), nats.UserInfo("accImp", "accImp"))
+	defer nc.Close()
+
+	_, err := nc.Request("foo", []byte("request"), 250*time.Millisecond)
+	require_Error(t, err, nats.ErrNoResponders)
 }

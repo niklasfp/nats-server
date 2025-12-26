@@ -1,4 +1,4 @@
-// Copyright 2020-2024 The NATS Authors
+// Copyright 2020-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -67,7 +68,6 @@ const (
 	wsCloseStatusProtocolError      = 1002
 	wsCloseStatusUnsupportedData    = 1003
 	wsCloseStatusNoStatusReceived   = 1005
-	wsCloseStatusAbnormalClosure    = 1006
 	wsCloseStatusInvalidPayloadData = 1007
 	wsCloseStatusPolicyViolation    = 1008
 	wsCloseStatusMessageTooBig      = 1009
@@ -212,6 +212,7 @@ func (c *client) wsRead(r *wsReadInfo, ior io.Reader, buf []byte) ([][]byte, err
 		err    error
 		pos    int
 		max    = len(buf)
+		mpay   = int(atomic.LoadInt32(&c.mpay))
 	)
 	for pos != max {
 		if r.fs {
@@ -325,7 +326,7 @@ func (c *client) wsRead(r *wsReadInfo, ior io.Reader, buf []byte) ([][]byte, err
 				// When we have the final frame and we have read the full payload,
 				// we can decompress it.
 				if r.ff && r.rem == 0 {
-					b, err = r.decompress()
+					b, err = r.decompress(mpay)
 					if err != nil {
 						return bufs, err
 					}
@@ -399,7 +400,16 @@ func (r *wsReadInfo) ReadByte() (byte, error) {
 	return b, nil
 }
 
-func (r *wsReadInfo) decompress() ([]byte, error) {
+// decompress decompresses the collected buffers.
+// The size of the decompressed buffer will be limited to the `mpay` value.
+// If, while decompressing, the resulting uncompressed buffer exceeds this
+// limit, the decompression stops and an empty buffer and the ErrMaxPayload
+// error are returned.
+func (r *wsReadInfo) decompress(mpay int) ([]byte, error) {
+	// If not limit is specified, use the default maximum payload size.
+	if mpay <= 0 {
+		mpay = MAX_PAYLOAD_SIZE
+	}
 	r.coff = 0
 	// As per https://tools.ietf.org/html/rfc7692#section-7.2.2
 	// add 0x00, 0x00, 0xff, 0xff and then a final block so that flate reader
@@ -414,8 +424,15 @@ func (r *wsReadInfo) decompress() ([]byte, error) {
 	} else {
 		d.(flate.Resetter).Reset(r, nil)
 	}
-	// This will do the decompression.
-	b, err := io.ReadAll(d)
+	// Use a LimitedReader to limit the decompressed size.
+	// We use "limit+1" bytes for "N" so we can detect if the limit is exceeded.
+	lr := io.LimitedReader{R: d, N: int64(mpay + 1)}
+	b, err := io.ReadAll(&lr)
+	if err == nil && len(b) > mpay {
+		// Decompressed data exceeds the maximum payload size.
+		b, err = nil, ErrMaxPayload
+	}
+	lr.R = nil
 	decompressorPool.Put(d)
 	// Now reset the compressed buffers list.
 	r.cbufs = nil
@@ -462,9 +479,21 @@ func (c *client) wsHandleControlFrame(r *wsReadInfo, frameType wsOpCode, nc io.R
 				}
 			}
 		}
-		clm := wsCreateCloseMessage(status, body)
+		// If the status indicates that nothing was received, then we don't
+		// send anything back.
+		// From https://datatracker.ietf.org/doc/html/rfc6455#section-7.4
+		// it says that code 1005 is a reserved value and MUST NOT be set as a
+		// status code in a Close control frame by an endpoint.  It is
+		// designated for use in applications expecting a status code to indicate
+		// that no status code was actually present.
+		var clm []byte
+		if status != wsCloseStatusNoStatusReceived {
+			clm = wsCreateCloseMessage(status, body)
+		}
 		c.wsEnqueueControlMessage(wsCloseMessage, clm)
-		nbPoolPut(clm) // wsEnqueueControlMessage has taken a copy.
+		if len(clm) > 0 {
+			nbPoolPut(clm) // wsEnqueueControlMessage has taken a copy.
+		}
 		// Return io.EOF so that readLoop will close the connection as ClientClosed
 		// after processing pending buffers.
 		return pos, io.EOF
@@ -651,10 +680,11 @@ func (c *client) wsEnqueueCloseMessage(reason ClosedState) {
 		status = wsCloseStatusProtocolError
 	case MaxPayloadExceeded:
 		status = wsCloseStatusMessageTooBig
-	case ServerShutdown:
+	case WriteError, ReadError, StaleConnection, ServerShutdown:
+		// We used to have WriteError, ReadError and StaleConnection result in
+		// code 1006, which the spec says that it must not be used to set the
+		// status in the close message. So using this one instead.
 		status = wsCloseStatusGoingAway
-	case WriteError, ReadError, StaleConnection:
-		status = wsCloseStatusAbnormalClosure
 	default:
 		status = wsCloseStatusInternalSrvError
 	}
@@ -1135,20 +1165,23 @@ func (s *Server) startWebsocketServer() {
 	// regardless of NoTLS. If we don't have a TLS config, it means that the
 	// user has configured NoTLS because otherwise the server would have failed
 	// to start due to options validation.
+	var config *tls.Config
 	if o.TLSConfig != nil {
 		proto = wsSchemePrefixTLS
-		config := o.TLSConfig.Clone()
+		config = o.TLSConfig.Clone()
 		config.GetConfigForClient = s.wsGetTLSConfig
-		hl, err = tls.Listen("tcp", hp, config)
 	} else {
 		proto = wsSchemePrefix
-		hl, err = net.Listen("tcp", hp)
 	}
+	hl, err = natsListen("tcp", hp)
 	s.websocket.listenerErr = err
 	if err != nil {
 		s.mu.Unlock()
 		s.Fatalf("Unable to listen for websocket connections: %v", err)
 		return
+	}
+	if config != nil {
+		hl = tls.NewListener(hl, config)
 	}
 	if port == 0 {
 		o.Port = hl.Addr().(*net.TCPAddr).Port
@@ -1279,7 +1312,7 @@ func (s *Server) createWSClient(conn net.Conn, ws *websocket) *client {
 	}
 	c.initClient()
 	c.Debugf("Client connection created")
-	c.sendProtoNow(c.generateClientInfoJSON(info))
+	c.sendProtoNow(c.generateClientInfoJSON(info, true))
 	c.mu.Unlock()
 
 	s.mu.Lock()
@@ -1350,6 +1383,9 @@ func (c *client) wsCollapsePtoNB() (net.Buffers, int64) {
 		}
 		if usz <= wsCompressThreshold {
 			compress = false
+			if cp := c.ws.compressor; cp != nil {
+				cp.Reset(nil)
+			}
 		}
 	}
 	if compress && len(nb) > 0 {
@@ -1367,12 +1403,23 @@ func (c *client) wsCollapsePtoNB() (net.Buffers, int64) {
 		}
 		var csz int
 		for _, b := range nb {
-			cp.Write(b)
+			for len(b) > 0 {
+				n, err := cp.Write(b)
+				if err != nil {
+					// Whatever this error is, it'll be handled by the cp.Flush()
+					// call below, as the same error will be returned there.
+					// Let the outer loop return all the buffers back to the pool
+					// and fall through naturally.
+					break
+				}
+				b = b[n:]
+			}
 			nbPoolPut(b) // No longer needed as contents written to compressor.
 		}
 		if err := cp.Flush(); err != nil {
 			c.Errorf("Error during compression: %v", err)
 			c.markConnAsClosed(WriteError)
+			cp.Reset(nil)
 			return nil, 0
 		}
 		b := buf.Bytes()
@@ -1488,6 +1535,7 @@ func (c *client) wsCollapsePtoNB() (net.Buffers, int64) {
 		bufs = append(bufs, c.ws.closeMsg)
 		c.ws.fs += int64(len(c.ws.closeMsg))
 		c.ws.closeMsg = nil
+		c.ws.compressor = nil
 	}
 	c.ws.frames = nil
 	return bufs, c.ws.fs

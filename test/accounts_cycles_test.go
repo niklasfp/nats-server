@@ -1,4 +1,4 @@
-// Copyright 2020 The NATS Authors
+// Copyright 2020-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -230,9 +230,19 @@ func TestServiceImportReplyMatchCycle(t *testing.T) {
 	defer nc1.Close()
 
 	msg := []byte("HELLO")
-	nc1.Subscribe("foo", func(m *nats.Msg) {
+	_, err := nc1.Subscribe("foo", func(m *nats.Msg) {
 		m.Respond(msg)
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure the subscription is known by the server we're connected to.
+	err = nc1.Flush()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSubInterest(t, s, "B", "foo", time.Second)
 
 	nc2 := clientConnectToServer(t, s)
 	defer nc2.Close()
@@ -273,9 +283,19 @@ func TestServiceImportReplyMatchCycleMultiHops(t *testing.T) {
 	defer nc1.Close()
 
 	msg := []byte("HELLO")
-	nc1.Subscribe("foo", func(m *nats.Msg) {
+	_, err := nc1.Subscribe("foo", func(m *nats.Msg) {
 		m.Respond(msg)
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure the subscription is known by the server we're connected to.
+	err = nc1.Flush()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkSubInterest(t, s, "B", "foo", time.Second)
 
 	nc2 := clientConnectToServer(t, s)
 	defer nc2.Close()

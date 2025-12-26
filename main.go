@@ -1,4 +1,4 @@
-// Copyright 2012-2022 The NATS Authors
+// Copyright 2012-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -38,7 +38,7 @@ Server Options:
     -c, --config <file>              Configuration file
     -t                               Test configuration and exit
     -sl,--signal <signal>[=<pid>]    Send signal to nats-server process (ldm, stop, quit, term, reopen, reload)
-                                     pid> can be either a PID (e.g. 1) or the path to a PID file (e.g. /var/run/nats-server.pid)
+                                     <pid> can be either a PID (e.g. 1) or the path to a PID file (e.g. /var/run/nats-server.pid)
         --client_advertise <string>  Client URL to advertise to other servers
         --ports_file_dir <dir>       Creates a ports file in the specified directory (<executable_name>_<pid>.ports).
 
@@ -113,7 +113,7 @@ func main() {
 	if err != nil {
 		server.PrintAndDie(fmt.Sprintf("%s: %s", exe, err))
 	} else if opts.CheckConfig {
-		fmt.Fprintf(os.Stderr, "%s: configuration file %s is valid\n", exe, opts.ConfigFile)
+		fmt.Fprintf(os.Stderr, "%s: configuration file %s is valid (%s)\n", exe, opts.ConfigFile, opts.ConfigDigest())
 		os.Exit(0)
 	}
 
@@ -128,7 +128,7 @@ func main() {
 		server.PrintAndDie(fmt.Sprintf("%s: %s", exe, err))
 	}
 
-	// Configure the logger based on the flags
+	// Configure the logger based on the flags.
 	s.ConfigureLogger()
 
 	// Start things up. Block here until done.

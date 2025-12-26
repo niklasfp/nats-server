@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The NATS Authors
+// Copyright 2020-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -12,7 +12,6 @@
 // limitations under the License.
 
 //go:build !skip_js_tests
-// +build !skip_js_tests
 
 package server
 
@@ -23,13 +22,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	jwt "github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
+
+	jwt "github.com/nats-io/jwt/v2"
 )
 
 func TestJetStreamJWTLimits(t *testing.T) {
@@ -325,6 +326,8 @@ func TestJetStreamJWTMove(t *testing.T) {
 		require_False(t, s.JetStreamEnabled())
 		updateJwt(t, s.ClientURL(), sysCreds, accJwt, 10)
 
+		sc.waitOnAccount(aExpPub)
+
 		s = sc.serverByName("C2-S1")
 		require_False(t, s.JetStreamEnabled())
 
@@ -345,10 +348,9 @@ func TestJetStreamJWTMove(t *testing.T) {
 		require_NoError(t, err)
 
 		// Perform actual move
-		ci, err = js.UpdateStream(&nats.StreamConfig{Name: "MOVE-ME", Replicas: replicas,
+		_, err = js.UpdateStream(&nats.StreamConfig{Name: "MOVE-ME", Replicas: replicas,
 			Placement: &nats.Placement{Tags: []string{"cloud:C2-tag"}}})
 		require_NoError(t, err)
-		require_Equal(t, ci.Cluster.Name, "C1")
 
 		sc.clusterForName("C2").waitOnStreamLeader(aExpPub, "MOVE-ME")
 
@@ -455,6 +457,9 @@ func TestJetStreamJWTClusteredTiers(t *testing.T) {
 
 	js, err := nc.JetStream()
 	require_NoError(t, err)
+
+	// Prevent 'nats: JetStream not enabled for account' when creating the first stream.
+	c.waitOnAccount(aExpPub)
 
 	// Test absent tiers
 	_, err = js.AddStream(&nats.StreamConfig{Name: "testR2", Replicas: 2, Subjects: []string{"testR2"}})
@@ -609,11 +614,16 @@ func TestJetStreamJWTClusteredTiersChange(t *testing.T) {
 	updateJwt(t, c.randomServer().ClientURL(), sysCreds, sysJwt, 3)
 	updateJwt(t, c.randomServer().ClientURL(), sysCreds, accJwt1, 3)
 
+	c.waitOnAccount(aExpPub)
+
 	nc := natsConnect(t, c.randomServer().ClientURL(), nats.UserCredentials(accCreds))
 	defer nc.Close()
 
 	js, err := nc.JetStream()
 	require_NoError(t, err)
+
+	// Prevent 'nats: JetStream not enabled for account' when creating the first stream.
+	c.waitOnAccount(aExpPub)
 
 	// Test tiers up to stream limits
 	cfg := &nats.StreamConfig{Name: "testR1-1", Replicas: 1, Subjects: []string{"testR1-1"}, MaxBytes: 1000}
@@ -693,19 +703,33 @@ func TestJetStreamJWTClusteredDeleteTierWithStreamAndMove(t *testing.T) {
 	updateJwt(t, c.randomServer().ClientURL(), sysCreds, sysJwt, 3)
 	updateJwt(t, c.randomServer().ClientURL(), sysCreds, accJwt1, 3)
 
+	c.waitOnAccount(aExpPub)
+
 	nc := natsConnect(t, c.randomServer().ClientURL(), nats.UserCredentials(accCreds))
 	defer nc.Close()
 
 	js, err := nc.JetStream()
 	require_NoError(t, err)
 
+	// Prevent 'nats: JetStream not enabled for account' when creating the first stream.
+	c.waitOnAccount(aExpPub)
+
 	// Test tiers up to stream limits
 	cfg := &nats.StreamConfig{Name: "testR1-1", Replicas: 1, Subjects: []string{"testR1-1"}, MaxBytes: 1000}
 	_, err = js.AddStream(cfg)
 	require_NoError(t, err)
 
+	sl := c.streamLeader(aExpPub, "testR1-1")
+	require_NotNil(t, sl)
+	acc, err := sl.lookupAccount(aExpPub)
+	require_NoError(t, err)
+	mset, err := acc.lookupStream("testR1-1")
+	require_NoError(t, err)
+	require_Equal(t, mset.lastSeq(), 0)
+
 	_, err = js.Publish("testR1-1", nil)
 	require_NoError(t, err)
+	require_Equal(t, mset.lastSeq(), 1)
 
 	time.Sleep(time.Second - time.Since(start)) // make sure the time stamp changes
 	delete(accClaim.Limits.JetStreamTieredLimits, "R1")
@@ -724,6 +748,7 @@ func TestJetStreamJWTClusteredDeleteTierWithStreamAndMove(t *testing.T) {
 	_, err = js.Publish("testR1-1", nil)
 	require_Error(t, err)
 	require_Equal(t, err.Error(), "nats: no JetStream default or applicable tiered limit present")
+	require_Equal(t, mset.lastSeq(), 1)
 
 	cfg.Replicas = 3
 	_, err = js.UpdateStream(cfg)
@@ -818,6 +843,9 @@ func TestJetStreamJWTSysAccUpdateMixedMode(t *testing.T) {
 
 	js, err := aNc.JetStream()
 	require_NoError(t, err)
+
+	// Prevent 'nats: JetStream not enabled for account' when creating the first stream.
+	sc.waitOnAccount(apub)
 
 	si, err := js.AddStream(&nats.StreamConfig{Name: "bar", Subjects: []string{"bar"}, Replicas: 3})
 	require_NoError(t, err)
@@ -971,6 +999,124 @@ func TestJetStreamJWTExpiredAccountNotCountedTowardLimits(t *testing.T) {
 	ai, err = jsB.AccountInfo()
 	require_NoError(t, err)
 	require_True(t, ai.Limits.MaxMemory == 7*1024*1024)
+}
+
+func TestJetStreamJWTExpiredAccountWorksAfterExpirationUpdated(t *testing.T) {
+	sysKp, spub := createKey(t)
+	sysClaim := jwt.NewAccountClaims(spub)
+	sysClaim.Name = "$SYS"
+	sysJwt, err := sysClaim.Encode(oKp)
+	require_NoError(t, err)
+	sysCreds := newUser(t, sysKp)
+
+	akp, apub := createKey(t)
+	require_NoError(t, err)
+	accClaim := jwt.NewAccountClaims(apub)
+	accClaim.Name = "TEST"
+	accClaim.Limits.JetStreamLimits = jwt.JetStreamLimits{MemoryStorage: 1024 * 1024, DiskStorage: 2048 * 1024, Streams: 1}
+	accJwt, err := accClaim.Encode(oKp)
+	require_NoError(t, err)
+
+	dirSrv := t.TempDir()
+	dir := t.TempDir()
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+				listen: 127.0.0.1:-1
+				jetstream: {max_mem_store: 10Mb, max_file_store: 10Mb, store_dir: "%s"}
+				operator: %s
+				system_account: %s
+				resolver: {
+					type: full
+					allow_delete: true
+					dir: '%s'
+				}
+			`, dirSrv, ojwt, spub, dir)))
+	defer removeFile(t, conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	updateJwt(t, s.ClientURL(), sysCreds, sysJwt, 1)
+	updateJwt(t, s.ClientURL(), sysCreds, accJwt, 1)
+
+	userCreds := newUser(t, akp)
+	nc, js := jsClientConnect(t, s, nats.UserCredentials(userCreds), nats.NoReconnect(),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+			// Default handler would print to stderr, silence it
+		}))
+	defer nc.Close()
+
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			if _, err := js.Publish("foo", []byte("hello")); err != nil {
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+	}()
+
+	// Update the account so it expires in 2 seconds.
+	expires := time.Now().Add(2 * time.Second)
+	accClaim.Expires = expires.Unix()
+	accJwt = encodeClaim(t, accClaim, apub)
+	updateJwt(t, s.ClientURL(), sysCreds, accJwt, 1)
+
+	// Wait for the publishing routine to fail.
+	wg.Wait()
+
+	// Close this client, we will create a new one.
+	nc.Close()
+
+	// Verify that we can't connect anymore. Because of rounding, we may have
+	// to try to avoid flapping.
+	for range 5 {
+		nc, err = nats.Connect(s.ClientURL(), nats.UserCredentials(userCreds), nats.NoReconnect(),
+			nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+				// Default handler would print to stderr, silence it
+			}))
+		if err != nil {
+			// ok!
+			break
+		}
+		nc.Close()
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Check that the user account is marked as expired.
+	az, err := s.Accountz(&AccountzOptions{Account: apub})
+	require_NoError(t, err)
+	require_True(t, az.Account != nil)
+	require_True(t, az.Account.Expired)
+	// But should still be true
+	require_True(t, az.Account.JetStream)
+
+	// Update the expiration to 1 hour
+	expires = time.Now().Add(time.Hour)
+	accClaim.Expires = expires.Unix()
+	accJwt = encodeClaim(t, accClaim, apub)
+	updateJwt(t, s.ClientURL(), sysCreds, accJwt, 1)
+
+	// Check that its is no longer expired and has still JetStream enabled.
+	az, err = s.Accountz(&AccountzOptions{Account: apub})
+	require_NoError(t, err)
+	require_True(t, az.Account != nil)
+	require_False(t, az.Account.Expired)
+	require_True(t, az.Account.JetStream)
+
+	// Create a connection and ensure we connect ok and can send a message.
+	nc, js = jsClientConnect(t, s, nats.UserCredentials(userCreds), nats.NoReconnect())
+	defer nc.Close()
+
+	_, err = js.Publish("foo", []byte("hello"))
+	require_NoError(t, err)
 }
 
 func TestJetStreamJWTDeletedAccountDoesNotLeakSubscriptions(t *testing.T) {
@@ -1308,6 +1454,9 @@ func TestJetStreamJWTHAStorageLimitsAndAccounting(t *testing.T) {
 	js, err := nc.JetStream()
 	require_NoError(t, err)
 
+	// Prevent 'nats: JetStream not enabled for account' when creating the first stream.
+	c.waitOnAccount(aExpPub)
+
 	// Test max bytes first.
 	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST", Replicas: 3, MaxBytes: maxFileStorage, Subjects: []string{"foo"}})
 	require_NoError(t, err)
@@ -1407,6 +1556,9 @@ func TestJetStreamJWTHAStorageLimitsOnScaleAndUpdate(t *testing.T) {
 	js, err := nc.JetStream()
 	require_NoError(t, err)
 
+	// Prevent 'nats: JetStream not enabled for account' when creating the first stream.
+	c.waitOnAccount(aExpPub)
+
 	// Test max bytes first.
 	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST", Replicas: 3, MaxBytes: maxFileStorage, Subjects: []string{"foo"}})
 	require_NoError(t, err)
@@ -1428,16 +1580,32 @@ func TestJetStreamJWTHAStorageLimitsOnScaleAndUpdate(t *testing.T) {
 	_, err = js.UpdateStream(&nats.StreamConfig{Name: "TEST2", Replicas: 3, MaxBytes: 512 * 1024})
 	require_NoError(t, err)
 	// Now make sure TEST6 succeeds.
-	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST6", Replicas: 3, MaxBytes: 1 * 1024 * 1024})
-	require_NoError(t, err)
+	checkFor(t, 1*time.Second, 500*time.Millisecond, func() error {
+		_, err = js.AddStream(&nats.StreamConfig{Name: "TEST6", Replicas: 3, MaxBytes: 1 * 1024 * 1024})
+		// Since the stream leader answers the stream update, and the meta leader determines resources,
+		// we could hit a race condition here. Simply retry if hit.
+		if err != nil && strings.Contains(err.Error(), "insufficient storage resources") {
+			return err
+		}
+		require_NoError(t, err)
+		return nil
+	})
 	// Now delete the R3 version.
 	require_NoError(t, js.DeleteStream("TEST6"))
 	// Now do R1 version and then we will scale up.
 	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST6", Replicas: 1, MaxBytes: 1 * 1024 * 1024})
 	require_NoError(t, err)
 	// Now make sure scale up works.
-	_, err = js.UpdateStream(&nats.StreamConfig{Name: "TEST6", Replicas: 3, MaxBytes: 1 * 1024 * 1024})
-	require_NoError(t, err)
+	checkFor(t, 1*time.Second, 500*time.Millisecond, func() error {
+		_, err = js.UpdateStream(&nats.StreamConfig{Name: "TEST6", Replicas: 3, MaxBytes: 1 * 1024 * 1024})
+		// Since the stream leader answers the stream add, and the meta leader determines stream not found,
+		// we could hit a race condition here. Simply retry if hit.
+		if err != nil && strings.Contains(err.Error(), "stream not found") {
+			return err
+		}
+		require_NoError(t, err)
+		return nil
+	})
 	// Add in a few more streams to check reserved reporting in account info.
 	_, err = js.AddStream(&nats.StreamConfig{Name: "TEST7", Replicas: 1, MaxBytes: 2 * 1024 * 1024})
 	require_NoError(t, err)
@@ -1503,6 +1671,9 @@ func TestJetStreamJWTClusteredTiersR3StreamWithR1ConsumersAndAccounting(t *testi
 	nc, js := jsClientConnect(t, c.randomServer(), nats.UserCredentials(accCreds))
 	defer nc.Close()
 
+	// Prevent 'nats: JetStream not enabled for account' when creating the first stream.
+	c.waitOnAccount(aExpPub)
+
 	_, err := js.AddStream(&nats.StreamConfig{
 		Name:     "TEST",
 		Subjects: []string{"foo.*"},
@@ -1531,4 +1702,405 @@ func TestJetStreamJWTClusteredTiersR3StreamWithR1ConsumersAndAccounting(t *testi
 	require_Equal(t, r1.Consumers, 10)
 	require_Equal(t, r3.Streams, 1)
 	require_Equal(t, r3.Consumers, 0)
+}
+
+func TestJetStreamJWTClusterAccountNRG(t *testing.T) {
+	_, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+
+	aExpKp, aExpPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(aExpPub)
+	accClaim.Name = "acc"
+	accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{DiskStorage: 1100, Consumer: 10, Streams: 1}
+	accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{DiskStorage: 1100, Consumer: 1, Streams: 1}
+	accJwt := encodeClaim(t, accClaim, aExpPub)
+	accCreds := newUser(t, aExpKp)
+
+	_, aExpPub2 := createKey(t)
+	accClaim2 := jwt.NewAccountClaims(aExpPub2)
+	accClaim2.Name = "another_acc"
+	accJwt2 := encodeClaim(t, accClaim2, aExpPub2)
+
+	tmlp := `
+		listen: 127.0.0.1:-1
+		server_name: %s
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+		leaf {
+			listen: 127.0.0.1:-1
+		}
+		cluster {
+			name: %s
+			listen: 127.0.0.1:%d
+			routes = [%s]
+		}
+	` + fmt.Sprintf(`
+		operator: %s
+		system_account: %s
+		resolver = MEMORY
+		resolver_preload = {
+			%s : %s
+			%s : %s
+			%s : %s
+		}
+	`, ojwt, syspub, syspub, sysJwt, aExpPub, accJwt, aExpPub2, accJwt2)
+
+	c := createJetStreamClusterWithTemplate(t, tmlp, "cluster", 3)
+	defer c.shutdown()
+
+	nc, _ := jsClientConnect(t, c.randomServer(), nats.UserCredentials(accCreds))
+	jsStreamCreate(t, nc, &StreamConfig{
+		Name:     "TEST",
+		Replicas: 3,
+		Storage:  FileStorage,
+	})
+
+	// We'll try flipping the state a few times and then do some sanity
+	// checks to check that it took effect.
+	thirdAcc := jwt.ClusterTraffic(fmt.Sprintf("account:%s", aExpPub2))
+	// TODO: Not currently testing thirdAcc because we haven't enabled this
+	// functionality yet. If/when we do enable, this test is ready just by
+	// uncommenting the third state below.
+	for _, state := range []jwt.ClusterTraffic{"system", "owner" /*, thirdAcc */} {
+		accClaim.ClusterTraffic = state
+		accJwt = encodeClaim(t, accClaim, aExpPub)
+
+		for _, s := range c.servers {
+			// Update the account claim for our "third account".
+			acc, err := s.lookupAccount(aExpPub2)
+			require_NoError(t, err)
+			require_NoError(t, s.updateAccountWithClaimJWT(acc, accJwt2))
+
+			// Then update the account claim for the asset account.
+			acc, err = s.lookupAccount(aExpPub)
+			require_NoError(t, err)
+			require_NoError(t, s.updateAccountWithClaimJWT(acc, accJwt))
+
+			// Check that everything looks like it should.
+			require_True(t, acc != nil)
+			require_True(t, acc.js != nil)
+			switch state {
+			case "system":
+				require_Equal(t, acc.nrgAccount, _EMPTY_)
+			case "owner":
+				require_Equal(t, acc.nrgAccount, aExpPub)
+			case thirdAcc:
+				require_Equal(t, acc.nrgAccount, aExpPub2)
+			}
+
+			// Now get a list of all of the Raft nodes that should
+			// have been updated by now.
+			s.rnMu.Lock()
+			raftNodes := make([]*raft, 0, len(s.raftNodes))
+			for _, n := range s.raftNodes {
+				rg := n.(*raft)
+				if rg.accName != acc.Name {
+					continue
+				}
+				raftNodes = append(raftNodes, rg)
+			}
+			s.rnMu.Unlock()
+
+			// Get the Raftz state also.
+			rz := s.Raftz(&RaftzOptions{AccountFilter: aExpPub})
+			require_NotNil(t, rz)
+			rza := (*rz)[aExpPub]
+			require_NotNil(t, rza)
+
+			// Check whether each of the Raft nodes reports being
+			// in-account or not.
+			for _, rg := range raftNodes {
+				rg.Lock()
+				rgAcc := rg.acc
+				rg.Unlock()
+				switch state {
+				case "system":
+					require_Equal(t, rgAcc.Name, syspub)
+					require_Equal(t, rza[rg.group].SystemAcc, true)
+					require_Equal(t, rza[rg.group].TrafficAcc, syspub)
+				case "owner":
+					require_Equal(t, rgAcc.Name, aExpPub)
+					require_Equal(t, rza[rg.group].SystemAcc, false)
+					require_Equal(t, rza[rg.group].TrafficAcc, aExpPub)
+				case thirdAcc:
+					require_Equal(t, rgAcc.Name, aExpPub2)
+					require_Equal(t, rza[rg.group].SystemAcc, false)
+					require_Equal(t, rza[rg.group].TrafficAcc, aExpPub2)
+				}
+			}
+		}
+	}
+}
+
+func TestJetStreamJWTClusterAccountNRGPersistsAfterRestart(t *testing.T) {
+	_, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+
+	aExpKp, aExpPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(aExpPub)
+	accClaim.Name = "acc"
+	accClaim.ClusterTraffic = jwt.ClusterTrafficOwner
+	accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{DiskStorage: 1100, Consumer: 10, Streams: 1}
+	accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{DiskStorage: 1100, Consumer: 1, Streams: 1}
+	accJwt := encodeClaim(t, accClaim, aExpPub)
+	accCreds := newUser(t, aExpKp)
+
+	tmlp := `
+		listen: 127.0.0.1:-1
+		server_name: %s
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+		leaf {
+			listen: 127.0.0.1:-1
+		}
+		cluster {
+			name: %s
+			listen: 127.0.0.1:%d
+			routes = [%s]
+		}
+	` + fmt.Sprintf(`
+		operator: %s
+		system_account: %s
+		resolver = MEMORY
+		resolver_preload = {
+			%s : %s
+			%s : %s
+		}
+	`, ojwt, syspub, syspub, sysJwt, aExpPub, accJwt)
+
+	c := createJetStreamClusterWithTemplate(t, tmlp, "cluster", 3)
+	defer c.shutdown()
+
+	nc, _ := jsClientConnect(t, c.randomServer(), nats.UserCredentials(accCreds))
+
+	// Prevent 'nats: JetStream not enabled for account' when creating the first stream.
+	c.waitOnAccount(aExpPub)
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:     "TEST",
+		Replicas: 3,
+		Storage:  FileStorage,
+	})
+	require_NoError(t, err)
+
+	// The account had cluster traffic set to "owner" already. Restarting servers should remember this setting.
+	for _, s := range c.servers {
+		acc, err := s.lookupAccount(aExpPub)
+		require_NoError(t, err)
+
+		// Check that everything looks like it should.
+		require_True(t, acc != nil)
+		require_True(t, acc.js != nil)
+		require_Equal(t, acc.nrgAccount, aExpPub)
+
+		// Now get a list of all the Raft nodes that should have the correct cluster traffic set.
+		s.rnMu.Lock()
+		raftNodes := make([]*raft, 0, len(s.raftNodes))
+		for _, n := range s.raftNodes {
+			rg := n.(*raft)
+			if rg.accName != acc.Name {
+				continue
+			}
+			raftNodes = append(raftNodes, rg)
+		}
+		s.rnMu.Unlock()
+
+		// Get the Raftz state also.
+		rz := s.Raftz(&RaftzOptions{AccountFilter: aExpPub})
+		require_NotNil(t, rz)
+		rza := (*rz)[aExpPub]
+		require_NotNil(t, rza)
+
+		for _, rg := range raftNodes {
+			rg.Lock()
+			rgAcc := rg.acc
+			rg.Unlock()
+			require_Equal(t, rgAcc.Name, aExpPub)
+			require_Equal(t, rza[rg.group].SystemAcc, false)
+			require_Equal(t, rza[rg.group].TrafficAcc, aExpPub)
+		}
+	}
+}
+
+func TestJetStreamJWTUpdateWithPreExistingStream(t *testing.T) {
+	updateJwt := func(url string, creds string, pubKey string, jwt string) {
+		t.Helper()
+		c := natsConnect(t, url, nats.UserCredentials(creds))
+		defer c.Close()
+		if msg, err := c.Request(fmt.Sprintf(accUpdateEventSubjNew, pubKey), []byte(jwt), time.Second); err != nil {
+			t.Fatal("error not expected in this test", err)
+		} else {
+			content := make(map[string]any)
+			if err := json.Unmarshal(msg.Data, &content); err != nil {
+				t.Fatalf("%v", err)
+			} else if _, ok := content["data"]; !ok {
+				t.Fatalf("did not get an ok response got: %v", content)
+			}
+		}
+	}
+	createUserCreds := func(akp nkeys.KeyPair) string {
+		uKp1, _ := nkeys.CreateUser()
+		uSeed1, _ := uKp1.Seed()
+		uclaim := newJWTTestUserClaims()
+		uclaim.Subject, _ = uKp1.PublicKey()
+		userJwt1, err := uclaim.Encode(akp)
+		require_NoError(t, err)
+		return genCredsFile(t, userJwt1, uSeed1)
+	}
+	// Create system account.
+	sysKp, _ := nkeys.CreateAccount()
+	sysPub, _ := sysKp.PublicKey()
+	sysUKp, _ := nkeys.CreateUser()
+	sysUSeed, _ := sysUKp.Seed()
+	uclaim := newJWTTestUserClaims()
+	uclaim.Subject, _ = sysUKp.PublicKey()
+	sysUserJwt, err := uclaim.Encode(sysKp)
+	require_NoError(t, err)
+	sysKp.Seed()
+	sysCreds := genCredsFile(t, sysUserJwt, sysUSeed)
+	// Create exporting account.
+	akpE, _ := nkeys.CreateAccount()
+	aPubE, _ := akpE.PublicKey()
+	claimE := jwt.NewAccountClaims(aPubE)
+	aJwtE, err := claimE.Encode(oKp)
+	require_NoError(t, err)
+	// Create importing account.
+	akpI, _ := nkeys.CreateAccount()
+	aPubI, _ := akpI.PublicKey()
+	claimI := jwt.NewAccountClaims(aPubI)
+	claimI.Limits.JetStreamLimits = jwt.JetStreamLimits{MemoryStorage: 1024 * 1024, DiskStorage: 1024 * 1024}
+	claimI.Imports.Add(&jwt.Import{
+		Name:    "import",
+		Subject: "foo",
+		Account: aPubE,
+		Type:    jwt.Stream,
+	})
+	aJwtI, err := claimI.Encode(oKp)
+	require_NoError(t, err)
+	// Create users.
+	userCredsE := createUserCreds(akpE)
+	userCredsI := createUserCreds(akpI)
+	// Start server and update JWTs.
+	dir := t.TempDir()
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		jetstream: {max_mem_store: 10Mb, max_file_store: 10Mb, store_dir: "%s"}
+		operator: %s
+		resolver: {
+			type: full
+			dir: '%s'
+		}
+		system_account: %s
+    `, dir, ojwt, dir, sysPub)))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+	updateJwt(s.ClientURL(), sysCreds, aPubI, aJwtI)
+	updateJwt(s.ClientURL(), sysCreds, aPubE, aJwtE)
+
+	// Create stream on importing account before we restart.
+	nci, js := jsClientConnect(t, s, nats.UserCredentials(userCredsI))
+	defer nci.Close()
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	// Restart server.
+	nci.Close()
+	s.Shutdown()
+	s.WaitForShutdown()
+	s, _ = RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// Reconnect and confirm stream is empty.
+	nci, js = jsClientConnect(t, s, nats.UserCredentials(userCredsI))
+	defer nci.Close()
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, 0)
+
+	// If an import/export gets added when the stream already existed on startup.
+	// We should still be able to route those messages.
+	claimE.Exports.Add(&jwt.Export{
+		Name:    "export",
+		Subject: "foo",
+		Type:    jwt.Stream,
+	})
+	aJwtE, err = claimE.Encode(oKp)
+	require_NoError(t, err)
+	updateJwt(s.ClientURL(), sysCreds, aPubE, aJwtE)
+
+	// Connect to exporting account and publish a message that should be exported/imported.
+	nce := natsConnect(t, s.ClientURL(), nats.UserCredentials(userCredsE))
+	defer nce.Close()
+	err = nce.Publish("foo", nil)
+	require_NoError(t, err)
+
+	// Confirm the message was captured by the stream on the importing account.
+	checkFor(t, 2*time.Second, 500*time.Millisecond, func() error {
+		if si, err = js.StreamInfo("TEST"); err != nil {
+			return err
+		} else if si.State.Msgs != 1 {
+			return fmt.Errorf("expected 1 message in stream, got %d", si.State.Msgs)
+		}
+		return nil
+	})
+}
+
+func TestJetStreamAccountResolverNoFetchIfNotMember(t *testing.T) {
+	_, spub := createKey(t)
+	sysClaim := jwt.NewAccountClaims(spub)
+	sysClaim.Name = "SYS"
+	sysJwt := encodeClaim(t, sysClaim, spub)
+	kp, _ := nkeys.CreateAccount()
+	aPub, _ := kp.PublicKey()
+
+	templ := `
+	listen: 127.0.0.1:-1
+	server_name: %s
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
+
+	leaf {
+		listen: 127.0.0.1:-1
+	}
+
+	cluster {
+		name: %s
+		listen: 127.0.0.1:%d
+		routes = [%s]
+	}
+`
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			w.Write([]byte("ok"))
+		} else if strings.HasSuffix(r.URL.Path, spub) {
+			w.Write([]byte(sysJwt))
+		} else {
+			// Simulate some time being spent, but doesn't respond.
+			time.Sleep(250 * time.Millisecond)
+		}
+	}))
+	defer ts.Close()
+
+	c := createJetStreamClusterWithTemplateAndModHook(t, templ, "R3S", 3,
+		func(serverName, clusterName, storeDir, conf string) string {
+			return conf + fmt.Sprintf(`
+				operator: %s
+				system_account: %s
+				resolver: URL("%s")`, ojwt, spub, ts.URL)
+		})
+	defer c.shutdown()
+
+	s := c.leader()
+	js := s.getJetStream()
+	ci := &ClientInfo{Cluster: "R3S", Account: aPub}
+	cfg := &StreamConfig{Name: "TEST", Subjects: []string{"foo"}}
+	sa := &streamAssignment{Client: ci, Config: cfg}
+	start := time.Now()
+	// Simulate some meta operations where this server is not a member.
+	// The server should not fetch the account from the resolver.
+	for range 5 {
+		js.processStreamAssignment(sa)
+	}
+	require_LessThan(t, time.Since(start), 100*time.Millisecond)
 }

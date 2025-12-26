@@ -203,7 +203,7 @@
     "constant": "JSInvalidJSONErr",
     "code": 400,
     "error_code": 10025,
-    "description": "invalid JSON",
+    "description": "invalid JSON: {err}",
     "comment": "",
     "help": "",
     "url": "",
@@ -833,7 +833,7 @@
     "constant": "JSConsumerPullRequiresAckErr",
     "code": 400,
     "error_code": 10084,
-    "description": "consumer in pull mode requires ack policy on workqueue stream",
+    "description": "consumer in pull mode requires explicit ack policy on workqueue stream",
     "comment": "",
     "help": "",
     "url": "",
@@ -1140,7 +1140,7 @@
     "deprecates": ""
   },
   {
-    "constant": "JSConsumerMaxRequestExpiresToSmall",
+    "constant": "JSConsumerMaxRequestExpiresTooSmall",
     "code": 400,
     "error_code": 10115,
     "description": "consumer max request expires needs to be \u003e= 1ms",
@@ -1564,6 +1564,446 @@
     "code": 409,
     "error_code": 10158,
     "description": "duplicate message id is in process",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerPriorityPolicyWithoutGroup",
+    "code": 400,
+    "error_code": 10159,
+    "description": "Setting PriorityPolicy requires at least one PriorityGroup to be set",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerInvalidPriorityGroupErr",
+    "code": 400,
+    "error_code": 10160,
+    "description": "Provided priority group does not exist for this consumer",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerEmptyGroupName",
+    "code": 400,
+    "error_code": 10161,
+    "description": "Group name cannot be an empty string",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerInvalidGroupNameErr",
+    "code": 400,
+    "error_code": 10162,
+    "description": "Valid priority group name must match A-Z, a-z, 0-9, -_/=)+ and may not exceed 16 characters",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSStreamExpectedLastSeqPerSubjectNotReady",
+    "code": 503,
+    "error_code": 10163,
+    "description": "expected last sequence per subject temporarily unavailable",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSStreamWrongLastSequenceConstantErr",
+    "code": 400,
+    "error_code": 10164,
+    "description": "wrong last sequence",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMessageTTLInvalidErr",
+    "code": 400,
+    "error_code": 10165,
+    "description": "invalid per-message TTL",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMessageTTLDisabledErr",
+    "code": 400,
+    "error_code": 10166,
+    "description": "per-message TTL is disabled",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSStreamTooManyRequests",
+    "code": 429,
+    "error_code": 10167,
+    "description": "too many requests",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMessageIncrDisabledErr",
+    "code": 400,
+    "error_code": 10168,
+    "description": "message counters is disabled",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMessageIncrMissingErr",
+    "code": 400,
+    "error_code": 10169,
+    "description": "message counter increment is missing",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMessageIncrPayloadErr",
+    "code": 400,
+    "error_code": 10170,
+    "description": "message counter has payload",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMessageIncrInvalidErr",
+    "code": 400,
+    "error_code": 10171,
+    "description": "message counter increment is invalid",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMessageCounterBrokenErr",
+    "code": 400,
+    "error_code": 10172,
+    "description": "message counter is broken",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMirrorWithCountersErr",
+    "code": 400,
+    "error_code": 10173,
+    "description": "stream mirrors can not also calculate counters",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSAtomicPublishDisabledErr",
+    "code": 400,
+    "error_code": 10174,
+    "description": "atomic publish is disabled",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSAtomicPublishMissingSeqErr",
+    "code": 400,
+    "error_code": 10175,
+    "description": "atomic publish sequence is missing",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSAtomicPublishIncompleteBatchErr",
+    "code": 400,
+    "error_code": 10176,
+    "description": "atomic publish batch is incomplete",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSAtomicPublishUnsupportedHeaderBatchErr",
+    "code": 400,
+    "error_code": 10177,
+    "description": "atomic publish unsupported header used: {header}",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerPushWithPriorityGroupErr",
+    "code": 400,
+    "error_code": 10178,
+    "description": "priority groups can not be used with push consumers",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSAtomicPublishInvalidBatchIDErr",
+    "code": 400,
+    "error_code": 10179,
+    "description": "atomic publish batch ID is invalid",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSStreamMinLastSeqErr",
+    "code": 412,
+    "error_code": 10180,
+    "description": "min last sequence",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerAckPolicyInvalidErr",
+    "code": 400,
+    "error_code": 10181,
+    "description": "consumer ack policy invalid",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerReplayPolicyInvalidErr",
+    "code": 400,
+    "error_code": 10182,
+    "description": "consumer replay policy invalid",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerAckWaitNegativeErr",
+    "code": 400,
+    "error_code": 10183,
+    "description": "consumer ack wait needs to be positive",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerBackOffNegativeErr",
+    "code": 400,
+    "error_code": 10184,
+    "description": "consumer backoff needs to be positive",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSRequiredApiLevelErr",
+    "code": 412,
+    "error_code": 10185,
+    "description": "JetStream minimum api level required",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMirrorWithMsgSchedulesErr",
+    "code": 400,
+    "error_code": 10186,
+    "description": "stream mirrors can not also schedule messages",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSSourceWithMsgSchedulesErr",
+    "code": 400,
+    "error_code": 10187,
+    "description": "stream source can not also schedule messages",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMessageSchedulesDisabledErr",
+    "code": 400,
+    "error_code": 10188,
+    "description": "message schedules is disabled",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMessageSchedulesPatternInvalidErr",
+    "code": 400,
+    "error_code": 10189,
+    "description": "message schedules pattern is invalid",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMessageSchedulesTargetInvalidErr",
+    "code": 400,
+    "error_code": 10190,
+    "description": "message schedules target is invalid",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMessageSchedulesTTLInvalidErr",
+    "code": 400,
+    "error_code": 10191,
+    "description": "message schedules invalid per-message TTL",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMessageSchedulesRollupInvalidErr",
+    "code": 400,
+    "error_code": 10192,
+    "description": "message schedules invalid rollup",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSStreamExpectedLastSeqPerSubjectInvalid",
+    "code": 400,
+    "error_code": 10193,
+    "description": "missing sequence for expected last sequence per subject",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSStreamOfflineReasonErrF",
+    "code": 500,
+    "error_code": 10194,
+    "description": "stream is offline: {err}",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerOfflineReasonErrF",
+    "code": 500,
+    "error_code": 10195,
+    "description": "consumer is offline: {err}",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerPriorityGroupWithPolicyNone",
+    "code": 400,
+    "error_code": 10196,
+    "description": "consumer can not have priority groups when policy is none",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerPinnedTTLWithoutPriorityPolicyNone",
+    "code": 400,
+    "error_code": 10197,
+    "description": "PinnedTTL cannot be set when PriorityPolicy is none",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSMirrorWithAtomicPublishErr",
+    "code": 400,
+    "error_code": 10198,
+    "description": "stream mirrors can not also use atomic publishing",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSAtomicPublishTooLargeBatchErrF",
+    "code": 400,
+    "error_code": 10199,
+    "description": "atomic publish batch is too large: {size}",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSAtomicPublishInvalidBatchCommitErr",
+    "code": 400,
+    "error_code": 10200,
+    "description": "atomic publish batch commit is invalid",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSAtomicPublishContainsDuplicateMessageErr",
+    "code": 400,
+    "error_code": 10201,
+    "description": "atomic publish batch contains duplicate message id",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSClusterServerMemberChangeInflightErr",
+    "code": 400,
+    "error_code": 10202,
+    "description": "cluster member change is in progress",
     "comment": "",
     "help": "",
     "url": "",

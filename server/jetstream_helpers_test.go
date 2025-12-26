@@ -1,4 +1,4 @@
-// Copyright 2020-2024 The NATS Authors
+// Copyright 2020-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,23 +14,32 @@
 // Do not exlude this file with the !skip_js_tests since those helpers
 // are also used by MQTT.
 
+//lint:file-ignore U1000 Avoid detecting as unused code
+
 package server
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"math/rand"
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"golang.org/x/time/rate"
+
+	"github.com/nats-io/nats-server/v2/internal/antithesis"
 )
 
 // Support functions
@@ -100,6 +109,10 @@ func (sc *supercluster) waitOnStreamLeader(account, stream string) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	antithesis.AssertUnreachable(sc.t, "Timeout in supercluster.waitOnStreamLeader", map[string]any{
+		"account": account,
+		"stream":  stream,
+	})
 	sc.t.Fatalf("Expected a stream leader for %q %q, got none", account, stream)
 }
 
@@ -107,7 +120,7 @@ var jsClusterAccountsTempl = `
 	listen: 127.0.0.1:-1
 
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
 
 	leaf {
 		listen: 127.0.0.1:-1
@@ -139,7 +152,7 @@ var jsClusterAccountsTempl = `
 var jsClusterTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
 
 	leaf {
 		listen: 127.0.0.1:-1
@@ -158,7 +171,7 @@ var jsClusterTempl = `
 var jsClusterEncryptedTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s', key: "s3cr3t!"}
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s', key: "s3cr3t!"}
 
 	leaf {
 		listen: 127.0.0.1:-1
@@ -177,7 +190,7 @@ var jsClusterEncryptedTempl = `
 var jsClusterMaxBytesTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
 
 	leaf {
 		listen: 127.0.0.1:-1
@@ -287,7 +300,7 @@ var jsGWTempl = `%s{name: %s, urls: [%s]}`
 var jsClusterAccountLimitsTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
 
 	cluster {
 		name: %s
@@ -322,31 +335,36 @@ func createJetStreamTaggedSuperClusterWithGWProxy(t *testing.T, gwm gwProxyMap) 
 	}
 
 	// Make first cluster AWS, US country code.
-	for _, s := range sc.clusterForName("C1").servers {
+	for i, s := range sc.clusterForName("C1").servers {
 		s.optsMu.Lock()
 		s.opts.Tags.Add("cloud:aws")
 		s.opts.Tags.Add("country:us")
+		s.opts.Tags.Add(fmt.Sprintf("node:%d", i+1))
 		s.optsMu.Unlock()
 		reset(s)
 	}
 	// Make second cluster GCP, UK country code.
-	for _, s := range sc.clusterForName("C2").servers {
+	for i, s := range sc.clusterForName("C2").servers {
 		s.optsMu.Lock()
 		s.opts.Tags.Add("cloud:gcp")
 		s.opts.Tags.Add("country:uk")
+		s.opts.Tags.Add(fmt.Sprintf("node:%d", i+1))
 		s.optsMu.Unlock()
 		reset(s)
 	}
 	// Make third cluster AZ, JP country code.
-	for _, s := range sc.clusterForName("C3").servers {
+	for i, s := range sc.clusterForName("C3").servers {
 		s.optsMu.Lock()
 		s.opts.Tags.Add("cloud:az")
 		s.opts.Tags.Add("country:jp")
+		s.opts.Tags.Add(fmt.Sprintf("node:%d", i+1))
 		s.optsMu.Unlock()
 		reset(s)
 	}
 
+	sc.waitOnLeader()
 	ml := sc.leader()
+	require_True(t, ml != nil)
 	js := ml.getJetStream()
 	require_True(t, js != nil)
 	js.mu.RLock()
@@ -549,7 +567,29 @@ func (sc *supercluster) waitOnLeader() {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
+	antithesis.AssertUnreachable(sc.t, "Timeout in supercluster.waitOnStreamLeader", nil)
 	sc.t.Fatalf("Expected a cluster leader, got none")
+}
+
+func (sc *supercluster) waitOnAccount(account string) {
+	sc.t.Helper()
+	expires := time.Now().Add(40 * time.Second)
+	for time.Now().Before(expires) {
+		found := true
+		for _, c := range sc.clusters {
+			for _, s := range c.servers {
+				acc, err := s.fetchAccount(account)
+				found = found && err == nil && acc != nil
+			}
+		}
+		if found {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+		continue
+	}
+
+	sc.t.Fatalf("Expected account %q to exist but didn't", account)
 }
 
 func (sc *supercluster) waitOnAllCurrent() {
@@ -579,20 +619,25 @@ func (sc *supercluster) waitOnPeerCount(n int) {
 	sc.waitOnLeader()
 	leader := sc.leader()
 	expires := time.Now().Add(30 * time.Second)
+	// Make sure we have all peers, and take into account the meta leader could still change.
 	for time.Now().Before(expires) {
-		peers := leader.JetStreamClusterPeers()
-		if len(peers) == n {
+		if leader = sc.leader(); leader == nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		if len(leader.JetStreamClusterPeers()) == n {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	antithesis.AssertUnreachable(sc.t, "Timeout in supercluster.waitOnPeerCount", nil)
 	sc.t.Fatalf("Expected a super cluster peer count of %d, got %d", n, len(leader.JetStreamClusterPeers()))
 }
 
 var jsClusterMirrorSourceImportsTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
 
 	cluster {
 		name: %s
@@ -628,7 +673,7 @@ var jsClusterMirrorSourceImportsTempl = `
 var jsClusterImportsTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
 
 	cluster {
 		name: %s
@@ -865,7 +910,7 @@ func (c *cluster) createSingleLeafNodeNoSystemAccountAndEnablesJetStreamWithDoma
 var jsClusterSingleLeafNodeLikeNGSTempl = `
 	listen: 127.0.0.1:-1
 	server_name: LNJS
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
 
 	leaf { remotes [ { urls: [ %s ] } ] }
 `
@@ -873,7 +918,7 @@ var jsClusterSingleLeafNodeLikeNGSTempl = `
 var jsClusterSingleLeafNodeTempl = `
 	listen: 127.0.0.1:-1
 	server_name: LNJS
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
 
 	leaf { remotes [
 		{ urls: [ %s ], account: "JSY" }
@@ -890,7 +935,7 @@ var jsClusterSingleLeafNodeTempl = `
 var jsClusterTemplWithLeafNode = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
 
 	{{leaf}}
 
@@ -909,7 +954,7 @@ var jsClusterTemplWithLeafNodeNoJS = `
 	server_name: %s
 
 	# Need to keep below since it fills in the store dir by default so just comment out.
-	# jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+	# jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
 
 	{{leaf}}
 
@@ -926,7 +971,7 @@ var jsClusterTemplWithLeafNodeNoJS = `
 var jsClusterTemplWithSingleLeafNode = `
 	listen: 127.0.0.1:-1
 	server_name: %s
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
 
 	{{leaf}}
 
@@ -938,7 +983,7 @@ var jsClusterTemplWithSingleFleetLeafNode = `
 	listen: 127.0.0.1:-1
 	server_name: %s
 	cluster: { name: fleet }
-	jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s'}
 
 	{{leaf}}
 
@@ -1135,6 +1180,16 @@ func (s *Server) setJetStreamMigrateOnRemoteLeaf() {
 	s.mu.Unlock()
 }
 
+// Helper to set the remote migrate feature.
+func (s *Server) setJetStreamMigrateOnRemoteLeafWithDelay(delay time.Duration) {
+	s.mu.Lock()
+	for _, cfg := range s.leafRemoteCfgs {
+		cfg.JetStreamClusterMigrate = true
+		cfg.JetStreamClusterMigrateDelay = delay
+	}
+	s.mu.Unlock()
+}
+
 // Will add in the mapping for the account to each server.
 func (c *cluster) addSubjectMapping(account, src, dest string) {
 	c.t.Helper()
@@ -1204,6 +1259,19 @@ func jsClientConnectEx(t testing.TB, s *Server, jsOpts []nats.JSOpt, opts ...nat
 	return nc, js
 }
 
+func jsClientConnectNewAPI(t testing.TB, s *Server, opts ...nats.Option) (*nats.Conn, jetstream.JetStream) {
+	t.Helper()
+	nc, err := nats.Connect(s.ClientURL(), opts...)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	js, err := jetstream.New(nc, jetstream.WithDefaultTimeout(10*time.Second))
+	if err != nil {
+		t.Fatalf("Unexpected error getting JetStream context: %v", err)
+	}
+	return nc, js
+}
+
 func jsClientConnectURL(t testing.TB, url string, opts ...nats.Option) (*nats.Conn, nats.JetStreamContext) {
 	t.Helper()
 
@@ -1216,6 +1284,48 @@ func jsClientConnectURL(t testing.TB, url string, opts ...nats.Option) (*nats.Co
 		t.Fatalf("Unexpected error getting JetStream context: %v", err)
 	}
 	return nc, js
+}
+
+// jsStreamCreate is for sending a stream create for fields that nats.go does not know about yet.
+func jsStreamCreate(t testing.TB, nc *nats.Conn, cfg *StreamConfig) (*StreamConfig, error) {
+	t.Helper()
+
+	j, err := json.Marshal(cfg)
+	require_NoError(t, err)
+
+	msg, err := nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), j, time.Second*3)
+	require_NoError(t, err)
+
+	var resp JSApiStreamUpdateResponse
+	require_NoError(t, json.Unmarshal(msg.Data, &resp))
+
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+
+	require_NotNil(t, resp.StreamInfo)
+	return &resp.Config, nil
+}
+
+// jsStreamUpdate is for sending a stream create for fields that nats.go does not know about yet.
+func jsStreamUpdate(t testing.TB, nc *nats.Conn, cfg *StreamConfig) (*StreamConfig, error) {
+	t.Helper()
+
+	j, err := json.Marshal(cfg)
+	require_NoError(t, err)
+
+	msg, err := nc.Request(fmt.Sprintf(JSApiStreamUpdateT, cfg.Name), j, time.Second*3)
+	require_NoError(t, err)
+
+	var resp JSApiStreamUpdateResponse
+	require_NoError(t, json.Unmarshal(msg.Data, &resp))
+
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+
+	require_NotNil(t, resp.StreamInfo)
+	return &resp.Config, nil
 }
 
 func checkSubsPending(t *testing.T, sub *nats.Subscription, numExpected int) {
@@ -1234,6 +1344,9 @@ func fetchMsgs(t *testing.T, sub *nats.Subscription, numExpected int, totalWait 
 	for start, count, wait := time.Now(), numExpected, totalWait; len(result) != numExpected; {
 		msgs, err := sub.Fetch(count, nats.MaxWait(wait))
 		if err != nil {
+			antithesis.AssertUnreachable(t, "Fetch error", map[string]any{
+				"error": err.Error(),
+			})
 			t.Fatal(err)
 		}
 		result = append(result, msgs...)
@@ -1243,6 +1356,10 @@ func fetchMsgs(t *testing.T, sub *nats.Subscription, numExpected int, totalWait 
 		}
 	}
 	if len(result) != numExpected {
+		antithesis.AssertUnreachable(t, "Unexpected fetch messages count", map[string]any{
+			"expected": numExpected,
+			"actual":   len(result),
+		})
 		t.Fatalf("Unexpected msg count, got %d, want %d", len(result), numExpected)
 	}
 	return result
@@ -1277,22 +1394,21 @@ func (c *cluster) waitOnPeerCount(n int) {
 	c.t.Helper()
 	c.waitOnLeader()
 	leader := c.leader()
-	for leader == nil {
-		c.waitOnLeader()
-		leader = c.leader()
-	}
 	expires := time.Now().Add(30 * time.Second)
+	// Make sure we have all peers, and take into account the meta leader could still change.
 	for time.Now().Before(expires) {
-		if peers := leader.JetStreamClusterPeers(); len(peers) == n {
+		if leader = c.leader(); leader == nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		if len(leader.JetStreamClusterPeers()) == n {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
-		leader = c.leader()
-		for leader == nil {
-			c.waitOnLeader()
-			leader = c.leader()
-		}
 	}
+	antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnPeerCount", map[string]any{
+		"cluster": c.name,
+	})
 	c.t.Fatalf("Expected a cluster peer count of %d, got %d", n, len(leader.JetStreamClusterPeers()))
 }
 
@@ -1306,6 +1422,12 @@ func (c *cluster) waitOnConsumerLeader(account, stream, consumer string) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnConsumerLeader", map[string]any{
+		"cluster":  c.name,
+		"account":  account,
+		"stream":   stream,
+		"consumer": consumer,
+	})
 	c.t.Fatalf("Expected a consumer leader for %q %q %q, got none", account, stream, consumer)
 }
 
@@ -1339,6 +1461,11 @@ func (c *cluster) waitOnStreamLeader(account, stream string) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnStreamLeader", map[string]any{
+		"cluster": c.name,
+		"account": account,
+		"stream":  stream,
+	})
 	c.t.Fatalf("Expected a stream leader for %q %q, got none", account, stream)
 }
 
@@ -1372,6 +1499,11 @@ func (c *cluster) waitOnStreamCurrent(s *Server, account, stream string) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnStreamCurrent", map[string]any{
+		"cluster": c.name,
+		"account": account,
+		"stream":  stream,
+	})
 	c.t.Fatalf("Expected server %q to eventually be current for stream %q", s, stream)
 }
 
@@ -1385,6 +1517,10 @@ func (c *cluster) waitOnServerHealthz(s *Server) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnServerHealthz", map[string]any{
+		"cluster": c.name,
+		"server":  s.Name(),
+	})
 	c.t.Fatalf("Expected server %q to eventually return healthz 'ok', but got %q", s, s.healthz(nil).Error)
 }
 
@@ -1397,6 +1533,10 @@ func (c *cluster) waitOnServerCurrent(s *Server) {
 			return
 		}
 	}
+	antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnServerCurrent", map[string]any{
+		"cluster": c.name,
+		"server":  s.Name(),
+	})
 	c.t.Fatalf("Expected server %q to eventually be current", s)
 }
 
@@ -1444,6 +1584,9 @@ func (c *cluster) expectNoLeader() {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	antithesis.AssertUnreachable(c.t, "Timeout in cluster.expectNoLeader", map[string]any{
+		"cluster": c.name,
+	})
 	c.t.Fatalf("Expected no leader but have one")
 }
 
@@ -1458,6 +1601,9 @@ func (c *cluster) waitOnLeader() {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnLeader", map[string]any{
+		"cluster": c.name,
+	})
 	c.t.Fatalf("Expected a cluster leader, got none")
 }
 
@@ -1467,8 +1613,13 @@ func (c *cluster) waitOnAccount(account string) {
 	for time.Now().Before(expires) {
 		found := true
 		for _, s := range c.servers {
+			s.optsMu.RLock()
+			wantJS := s.opts.JetStream
+			s.optsMu.RUnlock()
 			acc, err := s.fetchAccount(account)
-			found = found && err == nil && acc != nil
+			if found = found && err == nil && acc != nil; wantJS {
+				found = found && acc.JetStreamEnabled()
+			}
 		}
 		if found {
 			return
@@ -1477,6 +1628,9 @@ func (c *cluster) waitOnAccount(account string) {
 		continue
 	}
 
+	antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnAccount", map[string]any{
+		"account": account,
+	})
 	c.t.Fatalf("Expected account %q to exist but didn't", account)
 }
 
@@ -1491,14 +1645,12 @@ func (c *cluster) waitOnClusterReadyWithNumPeers(numPeersExpected int) {
 	c.t.Helper()
 	var leader *Server
 	expires := time.Now().Add(40 * time.Second)
+	// Make sure we have all peers, and take into account the meta leader could still change.
 	for time.Now().Before(expires) {
-		if leader = c.leader(); leader != nil {
-			break
+		if leader = c.leader(); leader == nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	// Now make sure we have all peers.
-	for leader != nil && time.Now().Before(expires) {
 		if len(leader.JetStreamClusterPeers()) == numPeersExpected {
 			time.Sleep(100 * time.Millisecond)
 			return
@@ -1508,6 +1660,9 @@ func (c *cluster) waitOnClusterReadyWithNumPeers(numPeersExpected int) {
 
 	if leader == nil {
 		c.shutdown()
+		antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnClusterReadyWithNumPeers (1)", map[string]any{
+			"cluster": c.name,
+		})
 		c.t.Fatalf("Failed to elect a meta-leader")
 	}
 
@@ -1515,8 +1670,16 @@ func (c *cluster) waitOnClusterReadyWithNumPeers(numPeersExpected int) {
 	c.shutdown()
 
 	if leader == nil {
+		antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnClusterReadyWithNumPeers (2)", map[string]any{
+			"cluster": c.name,
+		})
 		c.t.Fatalf("Expected a cluster leader and fully formed cluster, no leader")
 	} else {
+		antithesis.AssertUnreachable(c.t, "Timeout in cluster.waitOnClusterReadyWithNumPeers (3)", map[string]any{
+			"cluster":        c.name,
+			"peers_expected": numPeersExpected,
+			"peers_seen":     peersSeen,
+		})
 		c.t.Fatalf("Expected a fully formed cluster, only %d of %d peers seen", peersSeen, numPeersExpected)
 	}
 }
@@ -1553,6 +1716,9 @@ func (c *cluster) stopAll() {
 	for _, s := range c.servers {
 		s.Shutdown()
 	}
+	for _, s := range c.servers {
+		s.WaitForShutdown()
+	}
 }
 
 func (c *cluster) restartAll() {
@@ -1570,8 +1736,10 @@ func (c *cluster) restartAll() {
 
 func (c *cluster) lameDuckRestartAll() {
 	c.t.Helper()
-	for i, s := range c.servers {
+	for _, s := range c.servers {
 		s.lameDuckMode()
+	}
+	for i, s := range c.servers {
 		s.WaitForShutdown()
 		if !s.Running() {
 			opts := c.opts[i]
@@ -1715,6 +1883,7 @@ type netProxy struct {
 	down     int
 	url      string
 	surl     string
+	port     int
 }
 
 func newNetProxy(rtt time.Duration, upRate, downRate int, serverURL string) *netProxy {
@@ -1727,14 +1896,27 @@ func createNetProxy(rtt time.Duration, upRate, downRate int, serverURL string, s
 	if e != nil {
 		panic(fmt.Sprintf("Error listening on port: %s, %q", hp, e))
 	}
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		panic(fmt.Sprintf("Could not parse server URL: %v", err))
+	}
+
+	var clientURL string
 	port := l.Addr().(*net.TCPAddr).Port
+	if u.User != nil {
+		clientURL = fmt.Sprintf("nats://%v@127.0.0.1:%d", u.User, port)
+	} else {
+		clientURL = fmt.Sprintf("nats://127.0.0.1:%d", port)
+	}
+
 	proxy := &netProxy{
 		listener: l,
 		rtt:      rtt,
 		up:       upRate,
 		down:     downRate,
-		url:      fmt.Sprintf("nats://127.0.0.1:%d", port),
+		url:      clientURL,
 		surl:     serverURL,
+		port:     port,
 	}
 	if start {
 		proxy.start()
@@ -1748,6 +1930,16 @@ func (np *netProxy) start() {
 		panic(fmt.Sprintf("Could not parse server URL: %v", err))
 	}
 	host := u.Host
+
+	// Check if this is restart.
+	// We nil out listener on stop()
+	if np.listener == nil && np.port != 0 {
+		hp := net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", np.port))
+		np.listener, err = net.Listen("tcp", hp)
+		if err != nil {
+			panic(fmt.Sprintf("Error listening on port: %s, %q", hp, err))
+		}
+	}
 
 	go func() {
 		for {
@@ -1772,6 +1964,10 @@ func (np *netProxy) clientURL() string {
 
 func (np *netProxy) routeURL() string {
 	return strings.Replace(np.url, "nats", "nats-route", 1)
+}
+
+func (np *netProxy) leafURL() string {
+	return strings.Replace(np.url, "nats", "nats-leaf", 1)
 }
 
 func (np *netProxy) loop(tbw int, r, w net.Conn) {
@@ -1897,4 +2093,138 @@ func (b *bitset) String() string {
 	}
 	sb.WriteString("\n")
 	return sb.String()
+}
+
+func copyDir(t *testing.T, dst, src string) error {
+	t.Helper()
+	srcFS := os.DirFS(src)
+	return fs.WalkDir(srcFS, ".", func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		newPath := path.Join(dst, p)
+		if d.IsDir() {
+			return os.MkdirAll(newPath, defaultDirPerms)
+		}
+		r, err := srcFS.Open(p)
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+
+		w, err := os.OpenFile(newPath, os.O_CREATE|os.O_WRONLY, defaultFilePerms)
+		if err != nil {
+			return err
+		}
+		defer w.Close()
+		_, err = io.Copy(w, r)
+		return err
+	})
+}
+
+func getStreamDetails(t *testing.T, c *cluster, accountName, streamName string) *StreamDetail {
+	t.Helper()
+	srv := c.streamLeader(accountName, streamName)
+	if srv == nil {
+		return nil
+	}
+	jsz, err := srv.Jsz(&JSzOptions{Accounts: true, Streams: true, Consumer: true})
+	require_NoError(t, err)
+	for _, acc := range jsz.AccountDetails {
+		if acc.Name == accountName {
+			for _, stream := range acc.Streams {
+				if stream.Name == streamName {
+					return &stream
+				}
+			}
+		}
+	}
+	t.Error("Could not find account details")
+	return nil
+}
+
+func checkState(t *testing.T, c *cluster, accountName, streamName string) error {
+	t.Helper()
+
+	leaderSrv := c.streamLeader(accountName, streamName)
+	if leaderSrv == nil {
+		return fmt.Errorf("no leader server found for stream %q", streamName)
+	}
+	streamLeader := getStreamDetails(t, c, accountName, streamName)
+	if streamLeader == nil {
+		return fmt.Errorf("no leader found for stream %q", streamName)
+	}
+
+	acc, err := leaderSrv.LookupAccount(accountName)
+	require_NoError(t, err)
+	mset, err := acc.lookupStream(streamName)
+	require_NoError(t, err)
+
+	cfgReplicas := mset.cfg.Replicas
+	foundReplicas := 1 // We already know the leader.
+	var errs []error
+	for _, srv := range c.servers {
+		if srv == leaderSrv {
+			// Skip self
+			continue
+		}
+		if srv.isShuttingDown() {
+			// Skip if shutdown.
+			for _, replica := range streamLeader.Cluster.Replicas {
+				if replica.Name == srv.Name() {
+					foundReplicas++
+					break
+				}
+			}
+			continue
+		}
+		acc, err = srv.LookupAccount(accountName)
+		if err != nil {
+			continue
+		}
+		mset, err = acc.lookupStream(streamName)
+		if err != nil {
+			continue
+		}
+
+		foundReplicas++
+		state := mset.state()
+
+		if state.Msgs != streamLeader.State.Msgs {
+			err := fmt.Errorf("[%s] Leader %v has %d messages, Follower %v has %d messages",
+				streamName, leaderSrv, streamLeader.State.Msgs,
+				srv, state.Msgs,
+			)
+			errs = append(errs, err)
+		}
+		if state.FirstSeq != streamLeader.State.FirstSeq {
+			err := fmt.Errorf("[%s] Leader %v FirstSeq is %d, Follower %v is at %d",
+				streamName, leaderSrv, streamLeader.State.FirstSeq,
+				srv, state.FirstSeq,
+			)
+			errs = append(errs, err)
+		}
+		if state.LastSeq != streamLeader.State.LastSeq {
+			err := fmt.Errorf("[%s] Leader %v LastSeq is %d, Follower %v is at %d",
+				streamName, leaderSrv, streamLeader.State.LastSeq,
+				srv, state.LastSeq,
+			)
+			errs = append(errs, err)
+		}
+		if state.NumDeleted != streamLeader.State.NumDeleted {
+			err := fmt.Errorf("[%s] Leader %v NumDeleted is %d, Follower %v is at %d\nSTATE_A: %+v\nSTATE_B: %+v\n",
+				streamName, leaderSrv, streamLeader.State.NumDeleted,
+				srv, state.NumDeleted, streamLeader.State, state,
+			)
+			errs = append(errs, err)
+		}
+	}
+	if cfgReplicas != foundReplicas {
+		err := fmt.Errorf("[%s] Expected %d Replicas, got %d\n", streamName, cfgReplicas, foundReplicas)
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
 }
